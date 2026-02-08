@@ -336,6 +336,7 @@ fn greedy_mesh_chunk(
                             }
                         }
                     }
+
                 }
             }
         }
@@ -693,6 +694,7 @@ fn naive_mesh_chunk(
                     }
                 }
             }
+
         }
     }
 }
@@ -1127,7 +1129,9 @@ pub fn update_chunk_meshes(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut world_resource: ResMut<VoxelWorld>,
     config: Res<crate::terrain::TerrainConfig>,
+    mut performance_metrics: ResMut<crate::profiling::PerformanceMetrics>,
 ) {
+    let start_time = std::time::Instant::now();
     let _profiler = crate::profiling::Profiler::new("update_chunk_meshes");
     // Get all dirty chunks
     let dirty_chunks: Vec<_> = world_resource
@@ -1140,6 +1144,9 @@ pub fn update_chunk_meshes(
         dirty_chunks_count = dirty_chunks.len(),
         "Processing dirty chunks"
     );
+
+    let mut total_vertices = 0;
+    let mut total_triangles = 0;
 
     for chunk_pos in dirty_chunks {
         // We need to generate the mesh before modifying the chunk
@@ -1163,6 +1170,10 @@ pub fn update_chunk_meshes(
 
             // Calculate how many vertices we have
             let vertex_count = vertices.len() / 10; // 3 pos + 3 normal + 4 color = 10 floats per vertex
+            let triangle_count = indices.len() / 3;
+
+            total_vertices += vertex_count;
+            total_triangles += triangle_count;
 
             // Extract vertex data
             let mut positions = Vec::with_capacity(vertex_count);
@@ -1245,9 +1256,11 @@ pub fn update_chunk_meshes(
             }
         }
     }
-}
 
-/// Component to mark entities as voxel chunks.
+    // Update performance metrics
+    performance_metrics.update_mesh_stats(total_vertices, total_triangles);
+    performance_metrics.update_mesh_gen_time(start_time.elapsed());
+}
 ///
 /// This component is added to entities that represent rendered voxel chunks.
 /// It stores the chunk position so we can identify which chunk this entity represents.

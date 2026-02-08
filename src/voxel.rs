@@ -236,6 +236,11 @@ impl VoxelChunk {
         self.dirty = false;
     }
 
+    /// Checks if this chunk is visible.
+    pub fn is_visible(&self) -> bool {
+        self.entity.is_some()
+    }
+
     /// Sets the mesh handle for this chunk.
     pub fn set_mesh_handle(&mut self, handle: Handle<Mesh>) {
         self.mesh_handle = Some(handle);
@@ -438,6 +443,27 @@ impl VoxelWorld {
                 self.chunks.insert(pos, other_chunk);
             }
         }
+    }
+
+    /// Gets the total number of chunks in the world.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Gets the number of visible chunks.
+    pub fn visible_chunk_count(&self) -> usize {
+        self.chunks
+            .values()
+            .filter(|chunk| chunk.is_visible())
+            .count()
+    }
+
+    /// Gets the number of dirty chunks.
+    pub fn dirty_chunk_count(&self) -> usize {
+        self.chunks
+            .values()
+            .filter(|chunk| chunk.is_dirty())
+            .count()
     }
 }
 

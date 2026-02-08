@@ -5,11 +5,13 @@ use tracing::instrument;
 
 // Import our voxel system modules
 mod parallel_terrain;
+mod performance_hud;
 mod profiling;
 mod terrain;
 mod voxel;
 mod voxel_mesh;
 
+use performance_hud::PerformanceHudPlugin;
 use terrain::{
     generate_terrain_on_demand, initialize_terrain, manage_chunk_visibility, PlayerController,
     TerrainConfig,
@@ -35,6 +37,7 @@ fn main() {
                 })
                 .disable::<bevy::log::LogPlugin>(),
         )
+        .add_plugins(PerformanceHudPlugin)
         .insert_resource(VoxelWorld::new())
         .insert_resource(TerrainConfig::default())
         .add_systems(Startup, (setup, initialize_terrain))

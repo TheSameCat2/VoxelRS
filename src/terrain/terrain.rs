@@ -539,7 +539,11 @@ pub fn generate_terrain_on_demand(
     mut world_resource: ResMut<VoxelWorld>,
     config: Res<TerrainConfig>,
     player_query: Query<&Transform, With<PlayerController>>,
+    mut performance_metrics: ResMut<crate::profiling::PerformanceMetrics>,
 ) {
+    let start_time = std::time::Instant::now();
+    let mut chunks_generated = 0;
+
     if let Ok(player_transform) = player_query.get_single() {
         // Get player position in voxel coordinates
         let player_pos = player_transform.translation;
@@ -580,6 +584,8 @@ pub fn generate_terrain_on_demand(
                     .unwrap_or(false);
 
                 if !is_generated {
+                    chunks_generated += 1;
+
                     // Create terrain region
                     let region = crate::parallel_terrain::TerrainRegion::new(
                         min_x,
@@ -610,6 +616,13 @@ pub fn generate_terrain_on_demand(
                         );
                     }
                 }
+            }
+
+            // Update performance metrics if terrain was generated
+            if chunks_generated > 0 {
+                let elapsed = start_time.elapsed();
+                performance_metrics.update_terrain_gen_time(elapsed);
+                performance_metrics.chunk_updates += chunks_generated;
             }
         }
     }

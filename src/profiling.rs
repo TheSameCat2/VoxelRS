@@ -5,6 +5,7 @@
 /// and logging detailed information about system performance.
 use std::time::{Duration, Instant};
 use tracing::{debug, info, instrument};
+use bevy::prelude::Resource;
 
 /// A profiler that measures execution time and logs performance metrics.
 pub struct Profiler {
@@ -204,13 +205,15 @@ pub fn init_profiling() {
 }
 
 /// Performance metrics collection.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Resource)]
 pub struct PerformanceMetrics {
     pub terrain_generation_time: Duration,
     pub mesh_generation_time: Duration,
     pub chunk_updates: usize,
     pub vertices_generated: usize,
     pub triangles_generated: usize,
+    pub last_terrain_gen: Option<Duration>,
+    pub last_mesh_gen: Option<Duration>,
 }
 
 impl PerformanceMetrics {
@@ -227,5 +230,39 @@ impl PerformanceMetrics {
             triangles = self.triangles_generated,
             "Performance metrics summary"
         );
+    }
+
+    /// Get terrain generation time in milliseconds.
+    pub fn terrain_gen_time_ms(&self) -> f32 {
+        self.last_terrain_gen
+            .or(Some(self.terrain_generation_time))
+            .map(|d| d.as_millis() as f32)
+            .unwrap_or(0.0)
+    }
+
+    /// Get mesh generation time in milliseconds.
+    pub fn mesh_gen_time_ms(&self) -> f32 {
+        self.last_mesh_gen
+            .or(Some(self.mesh_generation_time))
+            .map(|d| d.as_millis() as f32)
+            .unwrap_or(0.0)
+    }
+
+    /// Update the last terrain generation time.
+    pub fn update_terrain_gen_time(&mut self, duration: Duration) {
+        self.last_terrain_gen = Some(duration);
+        self.terrain_generation_time += duration;
+    }
+
+    /// Update the last mesh generation time.
+    pub fn update_mesh_gen_time(&mut self, duration: Duration) {
+        self.last_mesh_gen = Some(duration);
+        self.mesh_generation_time += duration;
+    }
+
+    /// Update mesh statistics.
+    pub fn update_mesh_stats(&mut self, vertices: usize, triangles: usize) {
+        self.vertices_generated = vertices;
+        self.triangles_generated = triangles;
     }
 }
