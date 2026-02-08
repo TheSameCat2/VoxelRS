@@ -1,0 +1,30 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+**/*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+profiling.log
+.output.txt
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+
+# Bevy specific
+/assets/

@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    - name: Run tests
+      run: cargo test
+
+  build-and-release:
+    name: Build and Release
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            binary_name: my-test.exe
+            artifact_name: my-test.exe
+          - os: ubuntu-latest
+            name: Linux
+            binary_name: my-test
+            artifact_name: my-test
+          - os: macos-latest
+            name: macOS
+            binary_name: my-test
+            artifact_name: my-test
+
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.os == 'windows-latest' && 'x86_64-pc-windows-msvc' || matrix.os == 'ubuntu-latest' && 'x86_64-unknown-linux-gnu' || 'x86_64-apple-darwin' }}
+    
+    - name: Cache Rust dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Build release binary
+      run: cargo build --release --target ${{ matrix.os == 'windows-latest' && 'x86_64-pc-windows-msvc' || matrix.os == 'ubuntu-latest' && 'x86_64-unknown-linux-gnu' || 'x86_64-apple-darwin' }}
+    
+    - name: Prepare binary
+      shell: bash
+      run: |
+        mkdir -p dist
+        cp target/${{ matrix.os == 'windows-latest' && 'x86_64-pc-windows-msvc' || matrix.os == 'ubuntu-latest' && 'x86_64-unknown-linux-gnu' || 'x86_64-apple-darwin' }}/release/${{ matrix.binary_name }} dist/
+        cd dist
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          7z a ../my-test-${{ matrix.name }}-${{ github.sha }}.zip ${{ matrix.binary_name }}
+        else
+          tar czf ../my-test-${{ matrix.name }}-${{ github.sha }}.tar.gz ${{ matrix.binary_name }}
+        fi
+    
+    - name: Get commit message
+      id: commit_info
+      run: echo "message<<EOF\n$(git log -1 --pretty=%B)\nEOF" >> $GITHUB_OUTPUT
+    
+    - name: Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.sha }}
+        name: Release ${{ github.sha }}
+        body: ${{ steps.commit_info.outputs.message }}
+        files: |
+          my-test-${{ matrix.name }}-${{ github.sha }}.*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
