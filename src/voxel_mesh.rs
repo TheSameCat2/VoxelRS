@@ -14,8 +14,17 @@ use bevy::{
         mesh::{Indices, PrimitiveTopology},
         render_asset::RenderAssetUsages,
     },
+    tasks::{AsyncComputeTaskPool, Task},
 };
+use futures_lite::future;
 use tracing::{debug, instrument};
+
+/// Component to track background mesh generation tasks.
+#[derive(Component)]
+pub struct MeshGenerationTask {
+    pub task: Task<Option<(crate::voxel::ChunkPosition, Vec<f32>, Vec<u32>)>>,
+    pub chunk_pos: crate::voxel::ChunkPosition,
+}
 
 /// Directions in 3D space for face generation.
 ///
@@ -76,13 +85,13 @@ struct VoxelVertex {
 /// # Arguments
 ///
 /// * `chunk` - The chunk to generate a mesh for
-/// * `world` - The voxel world (needed for checking adjacent voxels)
+/// * `neighborhood` - The chunk neighborhood (needed for checking adjacent voxels)
 /// * `config` - Terrain configuration with greedy meshing option
 ///
 /// # Returns
 ///
 /// A tuple containing the vertex positions and indices for the mesh
-#[instrument(skip(chunk, world, config), fields(
+#[instrument(skip(chunk, neighborhood, config), fields(
     chunk_x = chunk.chunk_position.x,
     chunk_y = chunk.chunk_position.y,
     chunk_z = chunk.chunk_position.z,
@@ -90,7 +99,7 @@ struct VoxelVertex {
 ))]
 pub fn generate_chunk_mesh(
     chunk: &VoxelChunk,
-    world: &VoxelWorld,
+    neighborhood: &impl crate::voxel::VoxelAccess,
     config: &crate::terrain::TerrainConfig,
 ) -> Option<(Vec<f32>, Vec<u32>)> {
     let _profiler = crate::profiling::Profiler::new("mesh_generation");
@@ -103,7 +112,7 @@ pub fn generate_chunk_mesh(
         // Use greedy meshing for better performance
         greedy_mesh_chunk(
             chunk,
-            world,
+            neighborhood,
             &mut positions,
             &mut normals,
             &mut colors,
@@ -113,7 +122,7 @@ pub fn generate_chunk_mesh(
         // Fall back to naive mesh generation
         naive_mesh_chunk(
             chunk,
-            world,
+            neighborhood,
             &mut positions,
             &mut normals,
             &mut colors,
@@ -154,15 +163,15 @@ pub fn generate_chunk_mesh(
 /// # Arguments
 ///
 /// * `chunk` - The chunk to mesh
-/// * `world` - The voxel world
+/// * `neighborhood` - The chunk neighborhood
 /// * `positions` - Output buffer for vertex positions
 /// * `normals` - Output buffer for vertex normals
 /// * `colors` - Output buffer for vertex colors
 /// * `indices` - Output buffer for triangle indices
-#[instrument(skip(chunk, world, positions, normals, colors, indices))]
+#[instrument(skip(chunk, neighborhood, positions, normals, colors, indices))]
 fn greedy_mesh_chunk(
     chunk: &VoxelChunk,
-    world: &VoxelWorld,
+    neighborhood: &impl crate::voxel::VoxelAccess,
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     colors: &mut Vec<[f32; 4]>,
@@ -200,12 +209,12 @@ fn greedy_mesh_chunk(
                     }
 
                     // Check if this face should be rendered
-                    if should_render_face(chunk, world, &pos, direction) {
+                    if should_render_face(chunk, neighborhood, &pos, direction) {
                         match direction {
                             Direction::PositiveX => {
                                 let (width, height) = greedy_mesh_x_face(
                                     chunk,
-                                    world,
+                                    neighborhood,
                                     x,
                                     y,
                                     z,
@@ -214,7 +223,7 @@ fn greedy_mesh_chunk(
                                     direction,
                                 );
                                 add_quad(
-                                    Vec3::new(x as f32 + 0.5, y as f32 - 0.5, z as f32 - 0.5),
+                                    Vec3::new(x as f32 + 1.0, y as f32, z as f32),
                                     Vec3::new(0.0, height as f32, width as f32),
                                     Vec3::X,
                                     voxel,
@@ -227,7 +236,7 @@ fn greedy_mesh_chunk(
                             Direction::NegativeX => {
                                 let (width, height) = greedy_mesh_x_face(
                                     chunk,
-                                    world,
+                                    neighborhood,
                                     x,
                                     y,
                                     z,
@@ -236,7 +245,7 @@ fn greedy_mesh_chunk(
                                     direction,
                                 );
                                 add_quad(
-                                    Vec3::new(x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5),
+                                    Vec3::new(x as f32, y as f32, z as f32),
                                     Vec3::new(0.0, height as f32, width as f32),
                                     Vec3::NEG_X,
                                     voxel,
@@ -249,7 +258,7 @@ fn greedy_mesh_chunk(
                             Direction::PositiveY => {
                                 let (width, height) = greedy_mesh_y_face(
                                     chunk,
-                                    world,
+                                    neighborhood,
                                     x,
                                     y,
                                     z,
@@ -258,7 +267,7 @@ fn greedy_mesh_chunk(
                                     direction,
                                 );
                                 add_quad(
-                                    Vec3::new(x as f32 - 0.5, y as f32 + 0.5, z as f32 - 0.5),
+                                    Vec3::new(x as f32, y as f32 + 1.0, z as f32),
                                     Vec3::new(width as f32, 0.0, height as f32),
                                     Vec3::Y,
                                     voxel,
@@ -271,7 +280,7 @@ fn greedy_mesh_chunk(
                             Direction::NegativeY => {
                                 let (width, height) = greedy_mesh_y_face(
                                     chunk,
-                                    world,
+                                    neighborhood,
                                     x,
                                     y,
                                     z,
@@ -280,7 +289,7 @@ fn greedy_mesh_chunk(
                                     direction,
                                 );
                                 add_quad(
-                                    Vec3::new(x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5),
+                                    Vec3::new(x as f32, y as f32, z as f32),
                                     Vec3::new(width as f32, 0.0, height as f32),
                                     Vec3::NEG_Y,
                                     voxel,
@@ -293,7 +302,7 @@ fn greedy_mesh_chunk(
                             Direction::PositiveZ => {
                                 let (width, height) = greedy_mesh_z_face(
                                     chunk,
-                                    world,
+                                    neighborhood,
                                     x,
                                     y,
                                     z,
@@ -302,7 +311,7 @@ fn greedy_mesh_chunk(
                                     direction,
                                 );
                                 add_quad(
-                                    Vec3::new(x as f32 - 0.5, y as f32 - 0.5, z as f32 + 0.5),
+                                    Vec3::new(x as f32, y as f32, z as f32 + 1.0),
                                     Vec3::new(width as f32, height as f32, 0.0),
                                     Vec3::Z,
                                     voxel,
@@ -315,7 +324,7 @@ fn greedy_mesh_chunk(
                             Direction::NegativeZ => {
                                 let (width, height) = greedy_mesh_z_face(
                                     chunk,
-                                    world,
+                                    neighborhood,
                                     x,
                                     y,
                                     z,
@@ -324,7 +333,7 @@ fn greedy_mesh_chunk(
                                     direction,
                                 );
                                 add_quad(
-                                    Vec3::new(x as f32 - 0.5, y as f32 - 0.5, z as f32 - 0.5),
+                                    Vec3::new(x as f32, y as f32, z as f32),
                                     Vec3::new(width as f32, height as f32, 0.0),
                                     Vec3::NEG_Z,
                                     voxel,
@@ -366,7 +375,8 @@ mod tests {
             ..Default::default()
         };
 
-        let mesh_data = generate_chunk_mesh(&chunk, &world, &config);
+        let neighborhood = world.get_chunk_neighborhood(&chunk_pos);
+        let mesh_data = generate_chunk_mesh(&chunk, &neighborhood, &config);
         assert!(
             mesh_data.is_some(),
             "Mesh should be generated for a single voxel"
@@ -408,8 +418,9 @@ mod tests {
             ..Default::default()
         };
 
-        let mesh_greedy = generate_chunk_mesh(&chunk, &world, &config_greedy).unwrap();
-        let mesh_naive = generate_chunk_mesh(&chunk, &world, &config_naive).unwrap();
+        let neighborhood = world.get_chunk_neighborhood(&chunk_pos);
+        let mesh_greedy = generate_chunk_mesh(&chunk, &neighborhood, &config_greedy).unwrap();
+        let mesh_naive = generate_chunk_mesh(&chunk, &neighborhood, &config_naive).unwrap();
 
         // Compare vertex positions (ignoring order for now, but let's check number of non-degenerate quads)
         // Actually, let's just check that greedy doesn't produce fewer vertices than naive if we only have single voxels.
@@ -450,7 +461,7 @@ mod tests {
 /// Returns the width (in Z) and height (in Y) of the merged face.
 fn greedy_mesh_x_face(
     chunk: &VoxelChunk,
-    world: &VoxelWorld,
+    neighborhood: &impl crate::voxel::VoxelAccess,
     x: usize,
     y: usize,
     z: usize,
@@ -464,7 +475,7 @@ fn greedy_mesh_x_face(
     // Find maximum width in Z direction
     for z_check in z..CHUNK_SIZE {
         let pos = VoxelPosition::new(x as i32, y as i32, z_check as i32);
-        if !should_render_face(chunk, world, &pos, direction) {
+        if !should_render_face(chunk, neighborhood, &pos, direction) {
             break;
         }
         if chunk.get_voxel(pos).voxel_type != voxel.voxel_type {
@@ -480,7 +491,7 @@ fn greedy_mesh_x_face(
         for z_offset in 0..width {
             let z_check = z + z_offset;
             let pos = VoxelPosition::new(x as i32, y_check as i32, z_check as i32);
-            if !should_render_face(chunk, world, &pos, direction) {
+            if !should_render_face(chunk, neighborhood, &pos, direction) {
                 valid_row = false;
                 break;
             }
@@ -511,7 +522,7 @@ fn greedy_mesh_x_face(
 /// Finds the largest rectangle of identical faces in the Y direction.
 fn greedy_mesh_y_face(
     chunk: &VoxelChunk,
-    world: &VoxelWorld,
+    neighborhood: &impl crate::voxel::VoxelAccess,
     x: usize,
     y: usize,
     z: usize,
@@ -525,7 +536,7 @@ fn greedy_mesh_y_face(
     // Find maximum width in X direction
     for x_check in x..CHUNK_SIZE {
         let pos = VoxelPosition::new(x_check as i32, y as i32, z as i32);
-        if !should_render_face(chunk, world, &pos, direction) {
+        if !should_render_face(chunk, neighborhood, &pos, direction) {
             break;
         }
         if chunk.get_voxel(pos).voxel_type != voxel.voxel_type {
@@ -541,7 +552,7 @@ fn greedy_mesh_y_face(
         for x_offset in 0..width {
             let x_check = x + x_offset;
             let pos = VoxelPosition::new(x_check as i32, y as i32, z_check as i32);
-            if !should_render_face(chunk, world, &pos, direction) {
+            if !should_render_face(chunk, neighborhood, &pos, direction) {
                 valid_row = false;
                 break;
             }
@@ -572,7 +583,7 @@ fn greedy_mesh_y_face(
 /// Finds the largest rectangle of identical faces in the Z direction.
 fn greedy_mesh_z_face(
     chunk: &VoxelChunk,
-    world: &VoxelWorld,
+    neighborhood: &impl crate::voxel::VoxelAccess,
     x: usize,
     y: usize,
     z: usize,
@@ -586,7 +597,7 @@ fn greedy_mesh_z_face(
     // Find maximum width in X direction
     for x_check in x..CHUNK_SIZE {
         let pos = VoxelPosition::new(x_check as i32, y as i32, z as i32);
-        if !should_render_face(chunk, world, &pos, direction) {
+        if !should_render_face(chunk, neighborhood, &pos, direction) {
             break;
         }
         if chunk.get_voxel(pos).voxel_type != voxel.voxel_type {
@@ -602,7 +613,7 @@ fn greedy_mesh_z_face(
         for x_offset in 0..width {
             let x_check = x + x_offset;
             let pos = VoxelPosition::new(x_check as i32, y_check as i32, z as i32);
-            if !should_render_face(chunk, world, &pos, direction) {
+            if !should_render_face(chunk, neighborhood, &pos, direction) {
                 valid_row = false;
                 break;
             }
@@ -636,15 +647,15 @@ fn greedy_mesh_z_face(
 /// # Arguments
 ///
 /// * `chunk` - The chunk to mesh
-/// * `world` - The voxel world
+/// * `neighborhood` - The chunk neighborhood
 /// * `positions` - Output buffer for vertex positions
 /// * `normals` - Output buffer for vertex normals
 /// * `colors` - Output buffer for vertex colors
 /// * `indices` - Output buffer for triangle indices
-#[instrument(skip(chunk, world, positions, normals, colors, indices))]
+#[instrument(skip(chunk, neighborhood, positions, normals, colors, indices))]
 fn naive_mesh_chunk(
     chunk: &VoxelChunk,
-    world: &VoxelWorld,
+    neighborhood: &impl crate::voxel::VoxelAccess,
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
     colors: &mut Vec<[f32; 4]>,
@@ -674,7 +685,7 @@ fn naive_mesh_chunk(
 
                 // Check each of the 6 faces
                 for direction in Direction::all() {
-                    if should_render_face(chunk, world, &local_pos, direction) {
+                    if should_render_face(chunk, neighborhood, &local_pos, direction) {
                         let start_index = positions.len();
 
                         // Generate the 4 vertices for this face
@@ -716,40 +727,40 @@ fn generate_face_vertices(
 
     match direction {
         Direction::PositiveX => {
-            positions.push([position.x + 0.5, position.y - 0.5, position.z - 0.5]);
-            positions.push([position.x + 0.5, position.y + 0.5, position.z - 0.5]);
-            positions.push([position.x + 0.5, position.y + 0.5, position.z + 0.5]);
-            positions.push([position.x + 0.5, position.y - 0.5, position.z + 0.5]);
+            positions.push([position.x + 1.0, position.y, position.z]);
+            positions.push([position.x + 1.0, position.y + 1.0, position.z]);
+            positions.push([position.x + 1.0, position.y + 1.0, position.z + 1.0]);
+            positions.push([position.x + 1.0, position.y, position.z + 1.0]);
         }
         Direction::NegativeX => {
-            positions.push([position.x - 0.5, position.y - 0.5, position.z + 0.5]);
-            positions.push([position.x - 0.5, position.y + 0.5, position.z + 0.5]);
-            positions.push([position.x - 0.5, position.y + 0.5, position.z - 0.5]);
-            positions.push([position.x - 0.5, position.y - 0.5, position.z - 0.5]);
+            positions.push([position.x, position.y, position.z + 1.0]);
+            positions.push([position.x, position.y + 1.0, position.z + 1.0]);
+            positions.push([position.x, position.y + 1.0, position.z]);
+            positions.push([position.x, position.y, position.z]);
         }
         Direction::PositiveY => {
-            positions.push([position.x - 0.5, position.y + 0.5, position.z - 0.5]);
-            positions.push([position.x - 0.5, position.y + 0.5, position.z + 0.5]);
-            positions.push([position.x + 0.5, position.y + 0.5, position.z + 0.5]);
-            positions.push([position.x + 0.5, position.y + 0.5, position.z - 0.5]);
+            positions.push([position.x, position.y + 1.0, position.z]);
+            positions.push([position.x, position.y + 1.0, position.z + 1.0]);
+            positions.push([position.x + 1.0, position.y + 1.0, position.z + 1.0]);
+            positions.push([position.x + 1.0, position.y + 1.0, position.z]);
         }
         Direction::NegativeY => {
-            positions.push([position.x - 0.5, position.y - 0.5, position.z + 0.5]);
-            positions.push([position.x - 0.5, position.y - 0.5, position.z - 0.5]);
-            positions.push([position.x + 0.5, position.y - 0.5, position.z - 0.5]);
-            positions.push([position.x + 0.5, position.y - 0.5, position.z + 0.5]);
+            positions.push([position.x, position.y, position.z + 1.0]);
+            positions.push([position.x, position.y, position.z]);
+            positions.push([position.x + 1.0, position.y, position.z]);
+            positions.push([position.x + 1.0, position.y, position.z + 1.0]);
         }
         Direction::PositiveZ => {
-            positions.push([position.x - 0.5, position.y - 0.5, position.z + 0.5]);
-            positions.push([position.x - 0.5, position.y + 0.5, position.z + 0.5]);
-            positions.push([position.x + 0.5, position.y + 0.5, position.z + 0.5]);
-            positions.push([position.x + 0.5, position.y - 0.5, position.z + 0.5]);
+            positions.push([position.x, position.y, position.z + 1.0]);
+            positions.push([position.x, position.y + 1.0, position.z + 1.0]);
+            positions.push([position.x + 1.0, position.y + 1.0, position.z + 1.0]);
+            positions.push([position.x + 1.0, position.y, position.z + 1.0]);
         }
         Direction::NegativeZ => {
-            positions.push([position.x + 0.5, position.y - 0.5, position.z - 0.5]);
-            positions.push([position.x + 0.5, position.y + 0.5, position.z - 0.5]);
-            positions.push([position.x - 0.5, position.y + 0.5, position.z - 0.5]);
-            positions.push([position.x - 0.5, position.y - 0.5, position.z - 0.5]);
+            positions.push([position.x + 1.0, position.y, position.z]);
+            positions.push([position.x + 1.0, position.y + 1.0, position.z]);
+            positions.push([position.x, position.y + 1.0, position.z]);
+            positions.push([position.x, position.y, position.z]);
         }
     }
 
@@ -881,7 +892,7 @@ fn add_quad(
 /// # Arguments
 ///
 /// * `chunk` - The chunk containing the voxel
-/// * `world` - The voxel world
+/// * `neighborhood` - The chunk neighborhood
 /// * `local_pos` - Local position within the chunk
 /// * `direction` - The direction to check
 ///
@@ -890,7 +901,7 @@ fn add_quad(
 /// True if the face should be rendered, false otherwise
 fn should_render_face(
     chunk: &VoxelChunk,
-    world: &VoxelWorld,
+    neighborhood: &impl crate::voxel::VoxelAccess,
     local_pos: &VoxelPosition,
     direction: &Direction,
 ) -> bool {
@@ -910,28 +921,10 @@ fn should_render_face(
         Direction::NegativeZ => adjacent_pos.z -= 1,
     }
 
-    // Check if the adjacent position is within this chunk
-    if (0..CHUNK_SIZE as i32).contains(&adjacent_pos.x)
-        && (0..CHUNK_SIZE as i32).contains(&adjacent_pos.y)
-        && (0..CHUNK_SIZE as i32).contains(&adjacent_pos.z)
-    {
-        // Adjacent voxel is in the same chunk
-        let adjacent_voxel = chunk.get_voxel(adjacent_pos);
-        !adjacent_voxel.is_solid()
-    } else {
-        // Adjacent voxel is in a different chunk or doesn't exist
-        // Convert to world coordinates
-        let world_pos = VoxelPosition::new(
-            adjacent_pos.x + chunk.chunk_position.x * CHUNK_SIZE as i32,
-            adjacent_pos.y + chunk.chunk_position.y * CHUNK_SIZE as i32,
-            adjacent_pos.z + chunk.chunk_position.z * CHUNK_SIZE as i32,
-        );
-
-        // Check the world for the adjacent voxel
-        match world.get_voxel(&world_pos) {
-            Some(voxel) => !voxel.is_solid(),
-            None => true, // No voxel means air, so render the face
-        }
+    // Check the neighborhood for the adjacent voxel
+    match neighborhood.get_voxel(adjacent_pos) {
+        Some(voxel) => !voxel.is_solid(),
+        None => true, // No voxel means air, so render the face
     }
 }
 
@@ -955,22 +948,22 @@ fn generate_face_data(local_pos: &VoxelPosition, voxel: &Voxel, direction: &Dire
         Direction::PositiveX => FaceData {
             vertices: [
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y - 0.5, position.z - 0.5],
+                    position: [position.x + 1.0, position.y, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y + 0.5, position.z - 0.5],
+                    position: [position.x + 1.0, position.y + 1.0, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y + 0.5, position.z + 0.5],
+                    position: [position.x + 1.0, position.y + 1.0, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y - 0.5, position.z + 0.5],
+                    position: [position.x + 1.0, position.y, position.z + 1.0],
                     normal,
                     color,
                 },
@@ -979,22 +972,22 @@ fn generate_face_data(local_pos: &VoxelPosition, voxel: &Voxel, direction: &Dire
         Direction::NegativeX => FaceData {
             vertices: [
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y - 0.5, position.z + 0.5],
+                    position: [position.x, position.y, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y + 0.5, position.z + 0.5],
+                    position: [position.x, position.y + 1.0, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y + 0.5, position.z - 0.5],
+                    position: [position.x, position.y + 1.0, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y - 0.5, position.z - 0.5],
+                    position: [position.x, position.y, position.z],
                     normal,
                     color,
                 },
@@ -1003,22 +996,22 @@ fn generate_face_data(local_pos: &VoxelPosition, voxel: &Voxel, direction: &Dire
         Direction::PositiveY => FaceData {
             vertices: [
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y + 0.5, position.z + 0.5],
+                    position: [position.x, position.y + 1.0, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y + 0.5, position.z + 0.5],
+                    position: [position.x, position.y + 1.0, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y + 0.5, position.z - 0.5],
+                    position: [position.x + 1.0, position.y + 1.0, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y + 0.5, position.z - 0.5],
+                    position: [position.x + 1.0, position.y + 1.0, position.z],
                     normal,
                     color,
                 },
@@ -1027,22 +1020,22 @@ fn generate_face_data(local_pos: &VoxelPosition, voxel: &Voxel, direction: &Dire
         Direction::NegativeY => FaceData {
             vertices: [
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y - 0.5, position.z - 0.5],
+                    position: [position.x, position.y, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y - 0.5, position.z - 0.5],
+                    position: [position.x, position.y, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y - 0.5, position.z + 0.5],
+                    position: [position.x + 1.0, position.y, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y - 0.5, position.z + 0.5],
+                    position: [position.x + 1.0, position.y, position.z + 1.0],
                     normal,
                     color,
                 },
@@ -1051,22 +1044,22 @@ fn generate_face_data(local_pos: &VoxelPosition, voxel: &Voxel, direction: &Dire
         Direction::PositiveZ => FaceData {
             vertices: [
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y - 0.5, position.z + 0.5],
+                    position: [position.x, position.y, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y + 0.5, position.z + 0.5],
+                    position: [position.x, position.y + 1.0, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y + 0.5, position.z + 0.5],
+                    position: [position.x + 1.0, position.y + 1.0, position.z + 1.0],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y - 0.5, position.z + 0.5],
+                    position: [position.x + 1.0, position.y, position.z + 1.0],
                     normal,
                     color,
                 },
@@ -1075,22 +1068,22 @@ fn generate_face_data(local_pos: &VoxelPosition, voxel: &Voxel, direction: &Dire
         Direction::NegativeZ => FaceData {
             vertices: [
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y - 0.5, position.z - 0.5],
+                    position: [position.x + 1.0, position.y, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x + 0.5, position.y + 0.5, position.z - 0.5],
+                    position: [position.x + 1.0, position.y + 1.0, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y + 0.5, position.z - 0.5],
+                    position: [position.x, position.y + 1.0, position.z],
                     normal,
                     color,
                 },
                 VoxelVertex {
-                    position: [position.x - 0.5, position.y - 0.5, position.z - 0.5],
+                    position: [position.x, position.y, position.z],
                     normal,
                     color,
                 },
@@ -1122,145 +1115,180 @@ struct FaceData {
 /// * `meshes` - Asset storage for meshes
 /// * `materials` - Asset storage for materials
 /// * `world_resource` - Our voxel world resource
-#[instrument(skip(commands, meshes, materials, world_resource, config))]
+#[instrument(skip(commands, world_resource, config, _performance_metrics, task_query, player_query))]
 pub fn update_chunk_meshes(
+    mut commands: Commands,
+    mut world_resource: ResMut<VoxelWorld>,
+    config: Res<crate::terrain::TerrainConfig>,
+    _performance_metrics: Res<crate::profiling::PerformanceMetrics>,
+    task_query: Query<&MeshGenerationTask>,
+    player_query: Query<&Transform, With<crate::terrain::PlayerController>>,
+) {
+    let _profiler = crate::profiling::Profiler::new("update_chunk_meshes");
+    
+    // Limit total concurrent meshing tasks
+    if task_query.iter().count() > 16 {
+        return;
+    }
+
+    let player_pos = if let Ok(t) = player_query.get_single() {
+        t.translation
+    } else {
+        return;
+    };
+
+    let render_dist_sq = (config.render_distance as f32 * CHUNK_SIZE as f32 + CHUNK_SIZE as f32 * 2.0).powi(2);
+
+    // Get dirty chunks that aren't already pending, are ready, AND are within render distance
+    let dirty_chunks: Vec<_> = world_resource
+        .get_dirty_chunks()
+        .into_iter()
+        .filter(|pos| {
+            if world_resource.is_pending(pos) { return false; }
+            
+            // Distance check
+            let chunk_world_pos = Vec3::new(
+                (pos.x * CHUNK_SIZE as i32) as f32 + CHUNK_SIZE as f32 / 2.0,
+                player_pos.y, // Use 2D distance
+                (pos.z * CHUNK_SIZE as i32) as f32 + CHUNK_SIZE as f32 / 2.0,
+            );
+            
+            let dist_sq = (chunk_world_pos.x - player_pos.x).powi(2) + (chunk_world_pos.z - player_pos.z).powi(2);
+            if dist_sq > render_dist_sq { return false; }
+
+            world_resource.is_neighborhood_ready(pos)
+        })
+        .cloned()
+        .collect();
+
+    if dirty_chunks.is_empty() {
+        return;
+    }
+
+    // Spawn tasks for a few dirty chunks each frame
+    let thread_pool = AsyncComputeTaskPool::get();
+    let config_clone = config.clone();
+
+    // Sort by distance to player to prioritize closest chunks
+    let mut sorted_chunks = dirty_chunks;
+    sorted_chunks.sort_by(|a, b| {
+        let pos_a = Vec3::new((a.x * CHUNK_SIZE as i32) as f32, 0.0, (a.z * CHUNK_SIZE as i32) as f32);
+        let pos_b = Vec3::new((b.x * CHUNK_SIZE as i32) as f32, 0.0, (b.z * CHUNK_SIZE as i32) as f32);
+        let dist_a = (pos_a.x - player_pos.x).powi(2) + (pos_a.z - player_pos.z).powi(2);
+        let dist_b = (pos_b.x - player_pos.x).powi(2) + (pos_b.z - player_pos.z).powi(2);
+        dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Limit how many new tasks we spawn this frame to keep main thread responsive
+    for chunk_pos in sorted_chunks.into_iter().take(8) {
+        // Clone ONLY the neighborhood, not the whole world
+        let neighborhood = world_resource.get_owned_chunk_neighborhood(&chunk_pos);
+        let config_task = config_clone.clone();
+
+        // Mark as pending IMMEDIATELY on the main thread
+        world_resource.mark_pending(chunk_pos);
+
+        let task = thread_pool.spawn(async move {
+            if let Some(ref chunk) = neighborhood.center {
+                if let Some((vertices, indices)) = generate_chunk_mesh(chunk, &neighborhood, &config_task) {
+                    return Some((chunk_pos, vertices, indices));
+                }
+            }
+            None
+        });
+
+        commands.spawn(MeshGenerationTask { task, chunk_pos });
+    }
+}
+
+/// System to handle completed background mesh generation tasks.
+pub fn handle_mesh_tasks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut world_resource: ResMut<VoxelWorld>,
-    config: Res<crate::terrain::TerrainConfig>,
+    mut task_query: Query<(Entity, &mut MeshGenerationTask)>,
     mut performance_metrics: ResMut<crate::profiling::PerformanceMetrics>,
 ) {
-    let start_time = std::time::Instant::now();
-    let _profiler = crate::profiling::Profiler::new("update_chunk_meshes");
-    // Get all dirty chunks
-    let dirty_chunks: Vec<_> = world_resource
-        .get_dirty_chunks()
-        .into_iter()
-        .cloned()
-        .collect();
+    for (entity, mut task) in task_query.iter_mut() {
+        if let Some(res) = future::block_on(future::poll_once(&mut task.task)) {
+            let res: Option<(crate::voxel::ChunkPosition, Vec<f32>, Vec<u32>)> = res;
+            let start_time = std::time::Instant::now();
+            let chunk_pos = task.chunk_pos;
 
-    debug!(
-        dirty_chunks_count = dirty_chunks.len(),
-        "Processing dirty chunks"
-    );
+            // Get mutable access to update the chunk
+            let chunk = world_resource.get_chunk_mut(&chunk_pos);
 
-    let mut total_vertices = 0;
-    let mut total_triangles = 0;
-
-    for chunk_pos in dirty_chunks {
-        // We need to generate the mesh before modifying the chunk
-        let (chunk_key, chunk_world) = {
-            // Get a snapshot of the world for mesh generation
-            let chunk = world_resource.get_chunk(&chunk_pos).unwrap();
-            let chunk_data = generate_chunk_mesh(chunk, &world_resource, &config);
-            (chunk_pos, chunk_data)
-        };
-
-        // Now get mutable access to update the chunk
-        let chunk = world_resource.get_chunk_mut(&chunk_key);
-
-        // Check if we have mesh data
-        if let Some((vertices, indices)) = chunk_world {
-            // Create a new mesh
-            let mut mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            );
-
-            // Calculate how many vertices we have
-            let vertex_count = vertices.len() / 10; // 3 pos + 3 normal + 4 color = 10 floats per vertex
-            let triangle_count = indices.len() / 3;
-
-            total_vertices += vertex_count;
-            total_triangles += triangle_count;
-
-            // Extract vertex data
-            let mut positions = Vec::with_capacity(vertex_count);
-            let mut normals = Vec::with_capacity(vertex_count);
-            let mut colors = Vec::with_capacity(vertex_count);
-
-            for i in 0..vertex_count {
-                let offset = i * 10;
-                positions.push(Vec3::new(
-                    vertices[offset],
-                    vertices[offset + 1],
-                    vertices[offset + 2],
-                ));
-                normals.push(Vec3::new(
-                    vertices[offset + 3],
-                    vertices[offset + 4],
-                    vertices[offset + 5],
-                ));
-                colors.push(Vec4::new(
-                    vertices[offset + 6],
-                    vertices[offset + 7],
-                    vertices[offset + 8],
-                    vertices[offset + 9],
-                ));
-            }
-
-            // Set vertex attributes
-            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-            mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-
-            // Set indices
-            mesh.insert_indices(Indices::U32(indices));
-
-            // Add the mesh to the asset storage
-            let mesh_handle = meshes.add(mesh);
-
-            // Update the chunk with the new mesh handle
-            chunk.set_mesh_handle(mesh_handle.clone());
-            chunk.mark_clean();
-
-            // Update or spawn the entity
-            if let Some(entity) = chunk.get_entity() {
-                // Update existing entity
-                commands.entity(entity).insert(Mesh3d(mesh_handle));
-                debug!(
-                    chunk_x = chunk_pos.x,
-                    chunk_y = chunk_pos.y,
-                    chunk_z = chunk_pos.z,
-                    "Updated existing chunk entity"
+            if let Some((_, vertices, indices)) = res {
+                // Create a new mesh
+                let mut mesh = Mesh::new(
+                    PrimitiveTopology::TriangleList,
+                    RenderAssetUsages::default(),
                 );
+
+                let vertex_count = vertices.len() / 10;
+                let triangle_count = indices.len() / 3;
+
+                // Extract vertex data
+                let mut positions = Vec::with_capacity(vertex_count);
+                let mut normals = Vec::with_capacity(vertex_count);
+                let mut colors = Vec::with_capacity(vertex_count);
+
+                for i in 0..vertex_count {
+                    let offset = i * 10;
+                    positions.push(Vec3::new(vertices[offset], vertices[offset + 1], vertices[offset + 2]));
+                    normals.push(Vec3::new(vertices[offset + 3], vertices[offset + 4], vertices[offset + 5]));
+                    colors.push(Vec4::new(vertices[offset + 6], vertices[offset + 7], vertices[offset + 8], vertices[offset + 9]));
+                }
+
+                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+                mesh.insert_indices(Indices::U32(indices));
+
+                let mesh_handle = meshes.add(mesh);
+                chunk.set_mesh_handle(mesh_handle.clone());
+                chunk.mark_clean();
+
+                // Update or spawn the entity
+                if let Some(entity_in_world) = chunk.get_entity() {
+                    commands.entity(entity_in_world).insert(Mesh3d(mesh_handle));
+                } else {
+                    let material_handle = materials.add(StandardMaterial {
+                        base_color: Color::WHITE,
+                        perceptual_roughness: 1.0,
+                        metallic: 0.0,
+                        alpha_mode: AlphaMode::Opaque,
+                        cull_mode: Some(bevy::render::render_resource::Face::Back),
+                        ..default()
+                    });
+
+                    let chunk_entity = commands
+                        .spawn((
+                            Mesh3d(mesh_handle),
+                            MeshMaterial3d(material_handle),
+                            Transform::from_translation(chunk.get_world_position()),
+                            ChunkComponent(chunk_pos),
+                            Visibility::Hidden,
+                        ))
+                        .id();
+
+                    chunk.set_entity(chunk_entity);
+                }
+
+                performance_metrics.update_mesh_stats(vertex_count, triangle_count);
+                performance_metrics.update_mesh_gen_time(start_time.elapsed());
             } else {
-                // Create a material for this chunk
-                let material_handle = materials.add(StandardMaterial {
-                    base_color: Color::WHITE,
-                    perceptual_roughness: 1.0,
-                    metallic: 0.0,
-                    alpha_mode: AlphaMode::Opaque,
-                    cull_mode: Some(bevy::render::render_resource::Face::Back),
-                    ..default()
-                });
-
-                // Spawn a new entity for this chunk
-                let entity = commands
-                    .spawn((
-                        Mesh3d(mesh_handle),
-                        MeshMaterial3d(material_handle),
-                        Transform::from_translation(chunk.get_world_position()),
-                        ChunkComponent(chunk_pos),
-                    ))
-                    .id();
-
-                chunk.set_entity(entity);
-                debug!(
-                    chunk_x = chunk_pos.x,
-                    chunk_y = chunk_pos.y,
-                    chunk_z = chunk_pos.z,
-                    "Created new chunk entity"
-                );
+                // Empty chunk
+                chunk.mark_clean();
             }
+
+            commands.entity(entity).despawn();
+            world_resource.clear_pending(&chunk_pos);
         }
     }
-
-    // Update performance metrics
-    performance_metrics.update_mesh_stats(total_vertices, total_triangles);
-    performance_metrics.update_mesh_gen_time(start_time.elapsed());
 }
+
 ///
 /// This component is added to entities that represent rendered voxel chunks.
 /// It stores the chunk position so we can identify which chunk this entity represents.

@@ -262,7 +262,7 @@ impl PerformanceMetrics {
 
     /// Update mesh statistics.
     pub fn update_mesh_stats(&mut self, vertices: usize, triangles: usize) {
-        self.vertices_generated = vertices;
-        self.triangles_generated = triangles;
+        self.vertices_generated += vertices;
+        self.triangles_generated += triangles;
     }
 }

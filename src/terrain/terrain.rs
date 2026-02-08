@@ -4,8 +4,14 @@
 /// It includes both single-threaded and multithreaded implementations.
 use crate::voxel::{Voxel, VoxelPosition, VoxelType, VoxelWorld, CHUNK_SIZE};
 use bevy::prelude::*;
+use bevy::tasks::{AsyncComputeTaskPool, Task};
+use futures_lite::future;
 use noise::{NoiseFn, Perlin};
 use tracing::{debug, instrument};
+
+/// Component to track background terrain generation tasks.
+#[derive(Component)]
+pub struct TerrainGenerationTask(pub Task<(VoxelWorld, crate::parallel_terrain::TerrainGenerationMetrics)>);
 
 /// Configuration for terrain generation.
 ///
@@ -57,8 +63,8 @@ impl Default for TerrainConfig {
             enable_greedy_meshing: true,
             enable_multithreading: true,
             num_threads: 0, // 0 = auto-detect
-            generation_distance: 6,
-            render_distance: 5,
+            generation_distance: 20,
+            render_distance: 15,
             initial_world_size: 128,
         }
     }
@@ -135,70 +141,122 @@ impl TerrainGenerator {
         let mut caves_generated = 0;
         let mut trees_generated = 0;
 
-        for x in min_x..max_x {
-            for z in min_z..max_z {
-                // Generate height map
-                let height = self.get_height(x, z);
+        let chunk_size = CHUNK_SIZE as i32;
+        let min_cx = min_x.div_euclid(chunk_size);
+        let max_cx = (max_x - 1).div_euclid(chunk_size);
+        let min_cz = min_z.div_euclid(chunk_size);
+        let max_cz = (max_z - 1).div_euclid(chunk_size);
+        let min_cy = (self.config.min_surface_height - 10).div_euclid(chunk_size);
+        let max_cy = (max_y - 1).div_euclid(chunk_size);
 
-                // Generate terrain column
-                for y in (self.config.min_surface_height - 10)..max_y {
-                    let pos = VoxelPosition::new(x, y, z);
-
-                    if y < height {
-                        // Below ground level
-                        if self.is_cave(x, y, z) {
-                            // Cave - leave as air (or water below sea level)
-                            if y < self.config.water_level {
-                                // Water in caves below sea level
-                                let voxel = Voxel::new(
-                                    VoxelType::Destructible,
-                                    Color::srgba(0.2, 0.4, 0.8, 0.7),
-                                );
-                                world.set_voxel(&pos, voxel);
-                                voxels_generated += 1;
-                            }
-                            caves_generated += 1;
+        for cx in min_cx..=max_cx {
+            for cz in min_cz..=max_cz {
+                // Pre-calculate heights for this chunk column
+                let mut heights = [0i32; CHUNK_SIZE * CHUNK_SIZE];
+                for lz in 0..CHUNK_SIZE {
+                    let z = cz * chunk_size + lz as i32;
+                    if z < min_z || z >= max_z {
+                        continue;
+                    }
+                    for lx in 0..CHUNK_SIZE {
+                        let x = cx * chunk_size + lx as i32;
+                        if x < min_x || x >= max_x {
                             continue;
                         }
-
-                        // Generate different materials based on depth
-                        let voxel = if y < height - 3 {
-                            // Underground - stone/dirt mix
-                            if y < 0 {
-                                self.generate_stone()
-                            } else {
-                                self.generate_dirt()
-                            }
-                        } else if y < height - 1 {
-                            // Near surface - dirt
-                            self.generate_dirt()
-                        } else if y == height - 1 {
-                            // Surface - grass or sand
-                            if height <= self.config.water_level + 2 {
-                                // Beach areas near water
-                                Voxel::new(VoxelType::Solid, Color::srgb(0.9, 0.8, 0.6))
-                            } else {
-                                self.generate_grass()
-                            }
-                        } else {
-                            // Above ground - air
-                            Voxel::new(VoxelType::Air, Color::BLACK)
-                        };
-
-                        world.set_voxel(&pos, voxel);
-                    } else if y < self.config.water_level {
-                        // Below water level - fill with water (but not above terrain)
-                        let voxel =
-                            Voxel::new(VoxelType::Destructible, Color::srgba(0.2, 0.4, 0.8, 0.7));
-                        world.set_voxel(&pos, voxel);
-                        voxels_generated += 1;
+                        heights[lz * CHUNK_SIZE + lx] = self.get_height(x, z);
                     }
                 }
 
-                // Generate trees on surface
-                if height > self.config.tree_level && self.should_generate_tree(x, z) {
-                    self.generate_tree(world, x, height, z);
-                    trees_generated += 1;
+                for cy in min_cy..=max_cy {
+                    let chunk_pos = crate::voxel::ChunkPosition::new(cx, cy, cz);
+                    let chunk = world.get_chunk_mut(&chunk_pos);
+
+                    for lz in 0..CHUNK_SIZE {
+                        let z = cz * chunk_size + lz as i32;
+                        if z < min_z || z >= max_z {
+                            continue;
+                        }
+                        for lx in 0..CHUNK_SIZE {
+                            let x = cx * chunk_size + lx as i32;
+                            if x < min_x || x >= max_x {
+                                continue;
+                            }
+
+                            let height = heights[lz * CHUNK_SIZE + lx];
+
+                            for ly in 0..CHUNK_SIZE {
+                                let y = cy * chunk_size + ly as i32;
+                                if y >= max_y {
+                                    continue;
+                                }
+
+                                let pos = VoxelPosition::new(lx as i32, ly as i32, lz as i32);
+
+                                if y < height {
+                                    // Below ground level
+                                    if self.is_cave(x, y, z) {
+                                        if y < self.config.water_level {
+                                            let voxel = Voxel::new(
+                                                VoxelType::Destructible,
+                                                Color::srgba(0.2, 0.4, 0.8, 0.7),
+                                            );
+                                            chunk.set_voxel(pos, voxel);
+                                            voxels_generated += 1;
+                                        }
+                                        caves_generated += 1;
+                                        continue;
+                                    }
+
+                                    let voxel = if y < height - 3 {
+                                        if y < 0 {
+                                            self.generate_stone()
+                                        } else {
+                                            self.generate_dirt()
+                                        }
+                                    } else if y < height - 1 {
+                                        self.generate_dirt()
+                                    } else if y == height - 1 {
+                                        if height <= self.config.water_level + 2 {
+                                            Voxel::new(VoxelType::Solid, Color::srgb(0.9, 0.8, 0.6))
+                                        } else {
+                                            self.generate_grass()
+                                        }
+                                    } else {
+                                        Voxel::new(VoxelType::Air, Color::BLACK)
+                                    };
+
+                                    chunk.set_voxel(pos, voxel);
+                                } else if y < self.config.water_level {
+                                    let voxel = Voxel::new(
+                                        VoxelType::Destructible,
+                                        Color::srgba(0.2, 0.4, 0.8, 0.7),
+                                    );
+                                    chunk.set_voxel(pos, voxel);
+                                    voxels_generated += 1;
+                                }
+                            }
+                        }
+                    }
+                    chunk.generated = true;
+                }
+
+                // Generate trees on surface for this chunk column
+                for lz in 0..CHUNK_SIZE {
+                    let z = cz * chunk_size + lz as i32;
+                    if z < min_z || z >= max_z {
+                        continue;
+                    }
+                    for lx in 0..CHUNK_SIZE {
+                        let x = cx * chunk_size + lx as i32;
+                        if x < min_x || x >= max_x {
+                            continue;
+                        }
+                        let height = heights[lz * CHUNK_SIZE + lx];
+                        if height > self.config.tree_level && self.should_generate_tree(x, z) {
+                            self.generate_tree(world, x, height, z);
+                            trees_generated += 1;
+                        }
+                    }
                 }
             }
         }
@@ -221,25 +279,6 @@ impl TerrainGenerator {
             trees_generated = trees_generated,
             "Terrain generation metrics"
         );
-
-        // Mark all chunks in this region as generated
-        let chunk_size = CHUNK_SIZE as i32;
-        let min_cx = min_x.div_euclid(chunk_size);
-        let max_cx = (max_x - 1).div_euclid(chunk_size);
-        let min_cz = min_z.div_euclid(chunk_size);
-        let max_cz = (max_z - 1).div_euclid(chunk_size);
-        let min_cy = (self.config.min_surface_height - 10).div_euclid(chunk_size);
-        let max_cy = (max_y - 1).div_euclid(chunk_size);
-
-        for cx in min_cx..=max_cx {
-            for cz in min_cz..=max_cz {
-                for cy in min_cy..=max_cy {
-                    let chunk_pos = crate::voxel::ChunkPosition::new(cx, cy, cz);
-                    let chunk = world.get_chunk_mut(&chunk_pos);
-                    chunk.generated = true;
-                }
-            }
-        }
     }
 
     /// Gets terrain height at the given XZ coordinates.
@@ -325,7 +364,7 @@ impl TerrainGenerator {
 
         // Use noise to determine tree placement
         let tree_value = self.height_noise.get([nx, nz]);
-        tree_value > 0.7
+        tree_value > 0.9
     }
 
     /// Generates a tree at the given position.
@@ -397,40 +436,65 @@ impl TerrainGenerator {
         min_z: i32,
         max_z: i32,
     ) {
-        for x in min_x..max_x {
-            for y in min_y..max_y {
-                for z in min_z..max_z {
-                    let pos = VoxelPosition::new(x, y, z);
+        let chunk_size = CHUNK_SIZE as i32;
+        let min_cx = min_x.div_euclid(chunk_size);
+        let max_cx = (max_x - 1).div_euclid(chunk_size);
+        let min_cz = min_z.div_euclid(chunk_size);
+        let max_cz = (max_z - 1).div_euclid(chunk_size);
+        let min_cy = min_y.div_euclid(chunk_size);
+        let max_cy = (max_y - 1).div_euclid(chunk_size);
 
-                    // Skip air voxels
-                    if let Some(voxel) = world.get_voxel(&pos) {
-                        if voxel.voxel_type == VoxelType::Air {
+        for cx in min_cx..=max_cx {
+            for cz in min_cz..=max_cz {
+                for cy in min_cy..=max_cy {
+                    let chunk_pos = crate::voxel::ChunkPosition::new(cx, cy, cz);
+                    let chunk = world.get_chunk_mut(&chunk_pos);
+
+                    for lz in 0..CHUNK_SIZE {
+                        let z = cz * chunk_size + lz as i32;
+                        if z < min_z || z >= max_z {
                             continue;
                         }
+                        for ly in 0..CHUNK_SIZE {
+                            let y = cy * chunk_size + ly as i32;
+                            if y < min_y || y >= max_y {
+                                continue;
+                            }
+                            for lx in 0..CHUNK_SIZE {
+                                let x = cx * chunk_size + lx as i32;
+                                if x < min_x || x >= max_x {
+                                    continue;
+                                }
+
+                                let pos = VoxelPosition::new(lx as i32, ly as i32, lz as i32);
+
+                                // Skip air voxels
+                                if chunk.get_voxel(pos).voxel_type == VoxelType::Air {
+                                    continue;
+                                }
+
+                                // Use noise to determine ore placement
+                                let nx = x as f64 * self.config.scale * 5.0;
+                                let ny = y as f64 * self.config.scale * 5.0;
+                                let nz = z as f64 * self.config.scale * 5.0;
+
+                                let ore_value = self.ore_noise.get([nx, ny, nz]);
+
+                                // Different ores at different depths
+                                let ore_voxel = if y < 10 && ore_value > 0.85 {
+                                    Voxel::new(VoxelType::Magic, Color::srgb(0.8, 0.2, 0.2))
+                                } else if y < 20 && ore_value > 0.8 {
+                                    Voxel::new(VoxelType::Magic, Color::srgb(0.2, 0.2, 0.8))
+                                } else if y < 30 && ore_value > 0.75 {
+                                    Voxel::new(VoxelType::Magic, Color::srgb(0.2, 0.8, 0.2))
+                                } else {
+                                    continue;
+                                };
+
+                                chunk.set_voxel(pos, ore_voxel);
+                            }
+                        }
                     }
-
-                    // Use noise to determine ore placement
-                    let nx = x as f64 * self.config.scale * 5.0;
-                    let ny = y as f64 * self.config.scale * 5.0;
-                    let nz = z as f64 * self.config.scale * 5.0;
-
-                    let ore_value = self.ore_noise.get([nx, ny, nz]);
-
-                    // Different ores at different depths
-                    let ore_voxel = if y < 10 && ore_value > 0.85 {
-                        // Deep ore - red
-                        Voxel::new(VoxelType::Magic, Color::srgb(0.8, 0.2, 0.2))
-                    } else if y < 20 && ore_value > 0.8 {
-                        // Mid-depth ore - blue
-                        Voxel::new(VoxelType::Magic, Color::srgb(0.2, 0.2, 0.8))
-                    } else if y < 30 && ore_value > 0.75 {
-                        // Shallow ore - green
-                        Voxel::new(VoxelType::Magic, Color::srgb(0.2, 0.8, 0.2))
-                    } else {
-                        continue;
-                    };
-
-                    world.set_voxel(&pos, ore_voxel);
                 }
             }
         }
@@ -536,94 +600,137 @@ pub fn initialize_terrain(
 /// * `config` - Terrain configuration
 /// * `player_query` - Query to find player position
 pub fn generate_terrain_on_demand(
+    mut commands: Commands,
     mut world_resource: ResMut<VoxelWorld>,
     config: Res<TerrainConfig>,
     player_query: Query<&Transform, With<PlayerController>>,
-    mut performance_metrics: ResMut<crate::profiling::PerformanceMetrics>,
+    task_query: Query<&TerrainGenerationTask>,
 ) {
-    let start_time = std::time::Instant::now();
-    let mut chunks_generated = 0;
+    // Limit total concurrent terrain generation tasks
+    if task_query.iter().count() > 4 {
+        return;
+    }
 
     if let Ok(player_transform) = player_query.get_single() {
-        // Get player position in voxel coordinates
         let player_pos = player_transform.translation;
-        let player_voxel_x = player_pos.x as i32;
-        let player_voxel_z = player_pos.z as i32;
-
-        // Generate terrain in chunks around the player
-        let chunk_radius = config.generation_distance;
         let chunk_size = CHUNK_SIZE as i32;
+        let player_chunk_x = (player_pos.x as i32).div_euclid(chunk_size);
+        let player_chunk_z = (player_pos.z as i32).div_euclid(chunk_size);
 
-        let player_chunk_x = player_voxel_x.div_euclid(chunk_size);
-        let player_chunk_z = player_voxel_z.div_euclid(chunk_size);
+        let chunk_radius = config.generation_distance;
+        let mut chunks_to_generate = Vec::new();
 
         for dx in -chunk_radius..=chunk_radius {
             for dz in -chunk_radius..=chunk_radius {
-                // Calculate chunk coordinates
                 let cx = player_chunk_x + dx;
                 let cz = player_chunk_z + dz;
 
-                // Calculate chunk boundaries
-                let min_x = cx * chunk_size;
-                let max_x = min_x + chunk_size;
-                let min_z = cz * chunk_size;
-                let max_z = min_z + chunk_size;
-
-                // Check if this chunk already has terrain
-                // Use a more reliable check by looking for a chunk at a representative height
-                use crate::voxel::ChunkPosition;
-                let chunk_pos = ChunkPosition::new(
+                let chunk_pos = crate::voxel::ChunkPosition::new(
                     cx,
                     (config.min_surface_height - 10).div_euclid(chunk_size),
                     cz,
                 );
 
+                // Skip if already generated OR if already pending
                 let is_generated = world_resource
                     .get_chunk(&chunk_pos)
                     .map(|c| c.generated)
                     .unwrap_or(false);
 
-                if !is_generated {
-                    chunks_generated += 1;
-
-                    // Create terrain region
-                    let region = crate::parallel_terrain::TerrainRegion::new(
-                        min_x,
-                        max_x,
-                        min_z,
-                        max_z,
-                        config.max_surface_height + 10,
-                    );
-
-                    // Use multithreaded generation if enabled
-                    if config.enable_multithreading {
-                        let (new_world, _metrics) =
-                            crate::parallel_terrain::generate_terrain_parallel(
-                                &region,
-                                &config,
-                                config.num_threads,
-                            );
-                        world_resource.merge(new_world);
-                    } else {
-                        let generator = TerrainGenerator::new(config.clone());
-                        generator.generate_terrain(
-                            &mut world_resource,
-                            region.min_x,
-                            region.max_x,
-                            region.min_z,
-                            region.max_z,
-                            region.max_y,
-                        );
+                if !is_generated && !world_resource.is_pending(&chunk_pos) {
+                    chunks_to_generate.push((cx, cz));
+                    // Only batch a reasonable amount of chunks per task
+                    if chunks_to_generate.len() >= 16 {
+                        break;
                     }
                 }
             }
-
-            // Update performance metrics if terrain was generated
-            if chunks_generated > 0 {
-                let elapsed = start_time.elapsed();
-                performance_metrics.update_terrain_gen_time(elapsed);
-                performance_metrics.chunk_updates += chunks_generated;
+            if chunks_to_generate.len() >= 16 {
+                break;
             }
+        }
+
+        if !chunks_to_generate.is_empty() {
+            let min_cx = chunks_to_generate.iter().map(|(x, _)| *x).min().unwrap();
+            let max_cx = chunks_to_generate.iter().map(|(x, _)| *x).max().unwrap();
+            let min_cz = chunks_to_generate.iter().map(|(_, z)| *z).min().unwrap();
+            let max_cz = chunks_to_generate.iter().map(|(_, z)| *z).max().unwrap();
+
+            // Mark all chunks in this batch as pending IMMEDIATELY
+            for cx in min_cx..=max_cx {
+                for cz in min_cz..=max_cz {
+                    let cp = crate::voxel::ChunkPosition::new(
+                        cx,
+                        (config.min_surface_height - 10).div_euclid(chunk_size),
+                        cz,
+                    );
+                    world_resource.mark_pending(cp);
+                }
+            }
+
+            let region = crate::parallel_terrain::TerrainRegion::new(
+                min_cx * chunk_size,
+                (max_cx + 1) * chunk_size,
+                min_cz * chunk_size,
+                (max_cz + 1) * chunk_size,
+                config.max_surface_height + 10,
+            );
+
+            let thread_pool = AsyncComputeTaskPool::get();
+            let config_clone = config.clone();
+
+            let task = thread_pool.spawn(async move {
+                if config_clone.enable_multithreading {
+                    crate::parallel_terrain::generate_terrain_parallel(
+                        &region,
+                        &config_clone,
+                        config_clone.num_threads,
+                    )
+                } else {
+                    let mut local_world = VoxelWorld::new();
+                    let generator = TerrainGenerator::new(config_clone.clone());
+                    generator.generate_terrain(
+                        &mut local_world,
+                        region.min_x,
+                        region.max_x,
+                        region.min_z,
+                        region.max_z,
+                        region.max_y,
+                    );
+                    (local_world, crate::parallel_terrain::TerrainGenerationMetrics::default())
+                }
+            });
+
+            commands.spawn(TerrainGenerationTask(task));
+        }
+    }
+}
+
+/// System to handle completed background terrain generation tasks.
+pub fn handle_terrain_tasks(
+    mut commands: Commands,
+    mut world_resource: ResMut<VoxelWorld>,
+    mut task_query: Query<(Entity, &mut TerrainGenerationTask)>,
+    mut performance_metrics: ResMut<crate::profiling::PerformanceMetrics>,
+) {
+    for (entity, mut task) in task_query.iter_mut() {
+        if let Some(res) = future::block_on(future::poll_once(&mut task.0)) {
+            let (new_world, _metrics): (VoxelWorld, crate::parallel_terrain::TerrainGenerationMetrics) = res;
+            let start_time = std::time::Instant::now();
+            let chunk_count = new_world.chunk_count();
+            
+            // Clear pending status for all chunks in the new world
+            for (pos, _) in new_world.iter_chunks() {
+                world_resource.clear_pending(pos);
+            }
+
+            world_resource.merge(new_world);
+            
+            performance_metrics.update_terrain_gen_time(start_time.elapsed());
+            performance_metrics.chunk_updates += chunk_count;
+            
+            commands.entity(entity).despawn();
+            debug!(chunk_count, "Merged background terrain task results");
         }
     }
 }
@@ -646,13 +753,13 @@ pub fn manage_chunk_visibility(
         let player_pos = player_transform.translation;
         let chunk_size = CHUNK_SIZE as f32;
 
-        // Use a slightly larger radius for the actual check to avoid flickering at the edge
         let render_distance = config.render_distance as f32 * chunk_size;
-        let render_distance_sq = render_distance * render_distance;
+        let show_distance_sq = render_distance * render_distance;
+        // Hide slightly further away to provide hysteresis
+        let hide_distance_sq = (render_distance + 2.0) * (render_distance + 2.0);
 
         for (mut visibility, chunk_comp) in chunk_query.iter_mut() {
             let chunk_pos = chunk_comp.0;
-            // Calculate center of chunk in world coordinates (horizontal only)
             let chunk_center_x = (chunk_pos.x * CHUNK_SIZE as i32) as f32 + chunk_size / 2.0;
             let chunk_center_z = (chunk_pos.z * CHUNK_SIZE as i32) as f32 + chunk_size / 2.0;
 
@@ -660,13 +767,13 @@ pub fn manage_chunk_visibility(
             let dz = player_pos.z - chunk_center_z;
             let distance_sq = dx * dx + dz * dz;
 
-            if distance_sq > render_distance_sq {
-                if *visibility != Visibility::Hidden {
-                    *visibility = Visibility::Hidden;
+            if *visibility == Visibility::Hidden {
+                if distance_sq <= show_distance_sq {
+                    *visibility = Visibility::Inherited;
                 }
             } else {
-                if *visibility != Visibility::Inherited {
-                    *visibility = Visibility::Inherited;
+                if distance_sq > hide_distance_sq {
+                    *visibility = Visibility::Hidden;
                 }
             }
         }

@@ -234,7 +234,7 @@ pub fn collect_performance_metrics(
     mut performance_data: ResMut<HudPerformanceData>,
     world_resource: Res<VoxelWorld>,
     time: Res<Time<Real>>,
-    metrics: Res<PerformanceMetrics>,
+    mut metrics: ResMut<PerformanceMetrics>,
 ) {
     // Update FPS
     performance_data.update_fps();
@@ -243,8 +243,14 @@ pub fn collect_performance_metrics(
     // Collect metrics from profiling system
     performance_data.terrain_gen_time_ms = metrics.terrain_gen_time_ms();
     performance_data.mesh_gen_time_ms = metrics.mesh_gen_time_ms();
-    performance_data.vertices = metrics.vertices_generated;
-    performance_data.triangles = metrics.triangles_generated;
+    
+    // Accumulate mesh stats from this frame
+    performance_data.vertices += metrics.vertices_generated;
+    performance_data.triangles += metrics.triangles_generated;
+    
+    // Reset frame-based metrics
+    metrics.vertices_generated = 0;
+    metrics.triangles_generated = 0;
 
     // Collect chunk metrics (using public methods)
     performance_data.total_chunks = world_resource.chunk_count();
@@ -267,7 +273,7 @@ pub fn update_hud_display(
     mut query: Query<&mut Text, With<PerformanceHudText>>,
     time: Res<Time<Virtual>>,
     mut update_timer: ResMut<HudUpdateTimer>,
-    performance_data: Res<HudPerformanceData>,
+    mut performance_data: ResMut<HudPerformanceData>,
     hud_state: Res<HudState>,
 ) {
     // Only update if HUD is visible and timer has elapsed
@@ -320,14 +326,16 @@ pub fn update_hud_display(
             performance_data.chunks_dirty
         );
 
-        // Mesh statistics
-        if performance_data.vertices > 0 || performance_data.triangles > 0 {
-            let _ = writeln!(
-                display_text,
-                "Mesh: {} vertices, {} triangles",
-                performance_data.vertices, performance_data.triangles
-            );
-        }
+        // Mesh statistics (Throughput)
+        let _ = writeln!(
+            display_text,
+            "Gen (0.5s): {} verts, {} tris",
+            performance_data.vertices, performance_data.triangles
+        );
+        
+        // Reset accumulators for next interval
+        performance_data.vertices = 0;
+        performance_data.triangles = 0;
 
         // Memory usage
         let _ = writeln!(

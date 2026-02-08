@@ -292,6 +292,17 @@ impl VoxelChunk {
 pub struct VoxelWorld {
     /// All chunks in the world, indexed by chunk position
     chunks: std::collections::HashMap<ChunkPosition, VoxelChunk>,
+    /// Chunks that are currently being processed in background tasks
+    pending_chunks: std::collections::HashSet<ChunkPosition>,
+}
+
+/// Result of a voxel raycast.
+#[derive(Debug, Clone, Copy)]
+pub struct RaycastHit {
+    /// The position of the voxel that was hit
+    pub position: VoxelPosition,
+    /// The world normal of the face that was hit
+    pub normal: Vec3,
 }
 
 impl VoxelWorld {
@@ -299,7 +310,140 @@ impl VoxelWorld {
     pub fn new() -> Self {
         Self {
             chunks: std::collections::HashMap::new(),
+            pending_chunks: std::collections::HashSet::new(),
         }
+    }
+
+    /// Casts a ray into the voxel world and returns the first solid voxel hit.
+    ///
+    /// # Arguments
+    ///
+    /// * `origin` - The starting position of the ray in world coordinates
+    /// * `direction` - The normalized direction of the ray
+    /// * `max_distance` - The maximum distance to cast
+    ///
+    /// # Returns
+    ///
+    /// A RaycastHit if a solid voxel was hit, None otherwise
+    pub fn raycast(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RaycastHit> {
+        // Voxel DDA Algorithm
+        let mut x = origin.x.floor() as i32;
+        let mut y = origin.y.floor() as i32;
+        let mut z = origin.z.floor() as i32;
+
+        let step_x = direction.x.signum() as i32;
+        let step_y = direction.y.signum() as i32;
+        let step_z = direction.z.signum() as i32;
+
+        // t_max is the distance to the first boundary
+        // Handle division by zero or very small numbers
+        let t_delta_x = if direction.x.abs() < 1e-6 { f32::INFINITY } else { (1.0 / direction.x).abs() };
+        let t_delta_y = if direction.y.abs() < 1e-6 { f32::INFINITY } else { (1.0 / direction.y).abs() };
+        let t_delta_z = if direction.z.abs() < 1e-6 { f32::INFINITY } else { (1.0 / direction.z).abs() };
+
+        let mut t_max_x = if step_x > 0 { (x as f32 + 1.0 - origin.x) * t_delta_x } else { (origin.x - x as f32) * t_delta_x };
+        let mut t_max_y = if step_y > 0 { (y as f32 + 1.0 - origin.y) * t_delta_y } else { (origin.y - y as f32) * t_delta_y };
+        let mut t_max_z = if step_z > 0 { (z as f32 + 1.0 - origin.z) * t_delta_z } else { (origin.z - z as f32) * t_delta_z };
+        
+        // Handle the case where direction is exactly 0 (t_max will be correct via logic below usually, but good to be safe)
+        if direction.x == 0.0 { t_max_x = f32::INFINITY; }
+        if direction.y == 0.0 { t_max_y = f32::INFINITY; }
+        if direction.z == 0.0 { t_max_z = f32::INFINITY; }
+
+        let mut normal = Vec3::ZERO;
+
+        // Limit iterations to avoid infinite loops
+        let max_steps = (max_distance * 2.0).ceil() as i32 + 10;
+        
+        // Current distance traveled along ray
+        let mut t = 0.0;
+
+        for _ in 0..max_steps {
+            let voxel_pos = VoxelPosition::new(x, y, z);
+            if let Some(voxel) = self.get_voxel(&voxel_pos) {
+                if voxel.is_solid() {
+                    return Some(RaycastHit {
+                        position: voxel_pos,
+                        normal,
+                    });
+                }
+            }
+
+            if t_max_x < t_max_y {
+                if t_max_x < t_max_z {
+                    x += step_x;
+                    t = t_max_x;
+                    t_max_x += t_delta_x;
+                    normal = Vec3::new(-step_x as f32, 0.0, 0.0);
+                } else {
+                    z += step_z;
+                    t = t_max_z;
+                    t_max_z += t_delta_z;
+                    normal = Vec3::new(0.0, 0.0, -step_z as f32);
+                }
+            } else {
+                if t_max_y < t_max_z {
+                    y += step_y;
+                    t = t_max_y;
+                    t_max_y += t_delta_y;
+                    normal = Vec3::new(0.0, -step_y as f32, 0.0);
+                } else {
+                    z += step_z;
+                    t = t_max_z;
+                    t_max_z += t_delta_z;
+                    normal = Vec3::new(0.0, 0.0, -step_z as f32);
+                }
+            }
+
+            if t > max_distance {
+                break;
+            }
+        }
+
+        None
+    }
+
+    /// Marks a chunk as pending background processing.
+    pub fn mark_pending(&mut self, pos: ChunkPosition) {
+        self.pending_chunks.insert(pos);
+    }
+
+    /// Marks a chunk as no longer pending.
+    pub fn clear_pending(&mut self, pos: &ChunkPosition) {
+        self.pending_chunks.remove(pos);
+    }
+
+    /// Checks if a chunk is currently being processed.
+    pub fn is_pending(&self, pos: &ChunkPosition) -> bool {
+        self.pending_chunks.contains(pos)
+    }
+
+    /// Checks if a chunk and all its 6 neighbors are fully generated.
+    ///
+    /// This is used to ensure we only mesh chunks when they have full context
+    /// for proper face culling.
+    pub fn is_neighborhood_ready(&self, pos: &ChunkPosition) -> bool {
+        let neighbors = [
+            *pos,
+            ChunkPosition::new(pos.x - 1, pos.y, pos.z),
+            ChunkPosition::new(pos.x + 1, pos.y, pos.z),
+            ChunkPosition::new(pos.x, pos.y - 1, pos.z),
+            ChunkPosition::new(pos.x, pos.y + 1, pos.z),
+            ChunkPosition::new(pos.x, pos.y, pos.z - 1),
+            ChunkPosition::new(pos.x, pos.y, pos.z + 1),
+        ];
+
+        for n_pos in neighbors {
+            match self.chunks.get(&n_pos) {
+                Some(chunk) => {
+                    if !chunk.generated {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
     }
 
     /// Gets a chunk at the given chunk position.
@@ -363,6 +507,37 @@ impl VoxelWorld {
 
         let chunk = self.get_chunk_mut(&chunk_pos);
         chunk.set_voxel(local_pos, voxel);
+
+        // Mark neighbors as dirty if the voxel is on a boundary
+        let size = CHUNK_SIZE as i32;
+        if local_pos.x == 0 { self.mark_chunk_dirty(&ChunkPosition::new(chunk_pos.x - 1, chunk_pos.y, chunk_pos.z)); }
+        if local_pos.x == size - 1 { self.mark_chunk_dirty(&ChunkPosition::new(chunk_pos.x + 1, chunk_pos.y, chunk_pos.z)); }
+        if local_pos.y == 0 { self.mark_chunk_dirty(&ChunkPosition::new(chunk_pos.x, chunk_pos.y - 1, chunk_pos.z)); }
+        if local_pos.y == size - 1 { self.mark_chunk_dirty(&ChunkPosition::new(chunk_pos.x, chunk_pos.y + 1, chunk_pos.z)); }
+        if local_pos.z == 0 { self.mark_chunk_dirty(&ChunkPosition::new(chunk_pos.x, chunk_pos.y, chunk_pos.z - 1)); }
+        if local_pos.z == size - 1 { self.mark_chunk_dirty(&ChunkPosition::new(chunk_pos.x, chunk_pos.y, chunk_pos.z + 1)); }
+    }
+
+    /// Marks a specific chunk as dirty.
+    pub fn mark_chunk_dirty(&mut self, pos: &ChunkPosition) {
+        if let Some(chunk) = self.chunks.get_mut(pos) {
+            chunk.dirty = true;
+        }
+    }
+
+    /// Marks all 6 neighbors of a chunk as dirty.
+    pub fn mark_neighbors_dirty(&mut self, pos: &ChunkPosition) {
+        let neighbors = [
+            ChunkPosition::new(pos.x - 1, pos.y, pos.z),
+            ChunkPosition::new(pos.x + 1, pos.y, pos.z),
+            ChunkPosition::new(pos.x, pos.y - 1, pos.z),
+            ChunkPosition::new(pos.x, pos.y + 1, pos.z),
+            ChunkPosition::new(pos.x, pos.y, pos.z - 1),
+            ChunkPosition::new(pos.x, pos.y, pos.z + 1),
+        ];
+        for n_pos in neighbors {
+            self.mark_chunk_dirty(&n_pos);
+        }
     }
 
     /// Converts voxel coordinates to chunk coordinates.
@@ -396,6 +571,34 @@ impl VoxelWorld {
             x: voxel_pos.x.rem_euclid(CHUNK_SIZE as i32),
             y: voxel_pos.y.rem_euclid(CHUNK_SIZE as i32),
             z: voxel_pos.z.rem_euclid(CHUNK_SIZE as i32),
+        }
+    }
+
+    /// Gets a chunk and its 6 immediate neighbors.
+    ///
+    /// This is useful for mesh generation to avoid repeated hash map lookups.
+    pub fn get_chunk_neighborhood(&self, chunk_pos: &ChunkPosition) -> ChunkNeighborhood<'_> {
+        ChunkNeighborhood {
+            center: self.chunks.get(chunk_pos),
+            neg_x: self.chunks.get(&ChunkPosition::new(chunk_pos.x - 1, chunk_pos.y, chunk_pos.z)),
+            pos_x: self.chunks.get(&ChunkPosition::new(chunk_pos.x + 1, chunk_pos.y, chunk_pos.z)),
+            neg_y: self.chunks.get(&ChunkPosition::new(chunk_pos.x, chunk_pos.y - 1, chunk_pos.z)),
+            pos_y: self.chunks.get(&ChunkPosition::new(chunk_pos.x, chunk_pos.y + 1, chunk_pos.z)),
+            neg_z: self.chunks.get(&ChunkPosition::new(chunk_pos.x, chunk_pos.y, chunk_pos.z - 1)),
+            pos_z: self.chunks.get(&ChunkPosition::new(chunk_pos.x, chunk_pos.y, chunk_pos.z + 1)),
+        }
+    }
+
+    /// Gets an owned snapshot of a chunk and its 6 immediate neighbors.
+    pub fn get_owned_chunk_neighborhood(&self, chunk_pos: &ChunkPosition) -> OwnedChunkNeighborhood {
+        OwnedChunkNeighborhood {
+            center: self.chunks.get(chunk_pos).cloned(),
+            neg_x: self.chunks.get(&ChunkPosition::new(chunk_pos.x - 1, chunk_pos.y, chunk_pos.z)).cloned(),
+            pos_x: self.chunks.get(&ChunkPosition::new(chunk_pos.x + 1, chunk_pos.y, chunk_pos.z)).cloned(),
+            neg_y: self.chunks.get(&ChunkPosition::new(chunk_pos.x, chunk_pos.y - 1, chunk_pos.z)).cloned(),
+            pos_y: self.chunks.get(&ChunkPosition::new(chunk_pos.x, chunk_pos.y + 1, chunk_pos.z)).cloned(),
+            neg_z: self.chunks.get(&ChunkPosition::new(chunk_pos.x, chunk_pos.y, chunk_pos.z - 1)).cloned(),
+            pos_z: self.chunks.get(&ChunkPosition::new(chunk_pos.x, chunk_pos.y, chunk_pos.z + 1)).cloned(),
         }
     }
 
@@ -436,12 +639,27 @@ impl VoxelWorld {
     ///
     /// This will combine the contents of chunks that exist in both worlds.
     pub fn merge(&mut self, other: VoxelWorld) {
+        let mut chunks_to_mark_neighbors = Vec::new();
         for (pos, other_chunk) in other.chunks {
             if let Some(self_chunk) = self.chunks.get_mut(&pos) {
+                let was_generated = self_chunk.generated;
                 self_chunk.merge(other_chunk);
+                // If it just finished generating, we need to refresh neighbors
+                if !was_generated && self_chunk.generated {
+                    chunks_to_mark_neighbors.push(pos);
+                }
             } else {
+                let is_generated = other_chunk.generated;
                 self.chunks.insert(pos, other_chunk);
+                // If a new fully generated chunk appeared, mark neighbors
+                if is_generated {
+                    chunks_to_mark_neighbors.push(pos);
+                }
             }
+        }
+
+        for pos in chunks_to_mark_neighbors {
+            self.mark_neighbors_dirty(&pos);
         }
     }
 
@@ -464,6 +682,183 @@ impl VoxelWorld {
             .values()
             .filter(|chunk| chunk.is_dirty())
             .count()
+    }
+}
+
+/// Trait for unified access to voxels in a neighborhood.
+pub trait VoxelAccess {
+    fn get_voxel(&self, local_pos: VoxelPosition) -> Option<&Voxel>;
+}
+
+impl<'a> VoxelAccess for ChunkNeighborhood<'a> {
+    fn get_voxel(&self, local_pos: VoxelPosition) -> Option<&Voxel> {
+        self.get_voxel(local_pos)
+    }
+}
+
+impl VoxelAccess for OwnedChunkNeighborhood {
+    fn get_voxel(&self, local_pos: VoxelPosition) -> Option<&Voxel> {
+        self.get_voxel(local_pos)
+    }
+}
+
+/// A chunk and its 6 immediate neighbors, owning its data.
+///
+/// This is used to pass a snapshot of a neighborhood to a background task
+/// without needing to clone the entire world.
+pub struct OwnedChunkNeighborhood {
+    pub center: Option<VoxelChunk>,
+    pub neg_x: Option<VoxelChunk>,
+    pub pos_x: Option<VoxelChunk>,
+    pub neg_y: Option<VoxelChunk>,
+    pub pos_y: Option<VoxelChunk>,
+    pub neg_z: Option<VoxelChunk>,
+    pub pos_z: Option<VoxelChunk>,
+}
+
+impl OwnedChunkNeighborhood {
+    /// Gets a voxel at the given world-relative position within the neighborhood.
+    pub fn get_voxel(&self, local_pos: VoxelPosition) -> Option<&Voxel> {
+        if (0..CHUNK_SIZE as i32).contains(&local_pos.x)
+            && (0..CHUNK_SIZE as i32).contains(&local_pos.y)
+            && (0..CHUNK_SIZE as i32).contains(&local_pos.z)
+        {
+            return self.center.as_ref().map(|c| c.get_voxel(local_pos));
+        }
+
+        // Check neighbors
+        if local_pos.x < 0 {
+            self.neg_x.as_ref().map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x + CHUNK_SIZE as i32,
+                    local_pos.y,
+                    local_pos.z,
+                ))
+            })
+        } else if local_pos.x >= CHUNK_SIZE as i32 {
+            self.pos_x.as_ref().map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x - CHUNK_SIZE as i32,
+                    local_pos.y,
+                    local_pos.z,
+                ))
+            })
+        } else if local_pos.y < 0 {
+            self.neg_y.as_ref().map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x,
+                    local_pos.y + CHUNK_SIZE as i32,
+                    local_pos.z,
+                ))
+            })
+        } else if local_pos.y >= CHUNK_SIZE as i32 {
+            self.pos_y.as_ref().map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x,
+                    local_pos.y - CHUNK_SIZE as i32,
+                    local_pos.z,
+                ))
+            })
+        } else if local_pos.z < 0 {
+            self.neg_z.as_ref().map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x,
+                    local_pos.y,
+                    local_pos.z + CHUNK_SIZE as i32,
+                ))
+            })
+        } else if local_pos.z >= CHUNK_SIZE as i32 {
+            self.pos_z.as_ref().map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x,
+                    local_pos.y,
+                    local_pos.z - CHUNK_SIZE as i32,
+                ))
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// A chunk and its 6 immediate neighbors.
+///
+/// This is used to provide efficient access to adjacent voxels
+/// during mesh generation, avoiding repeated HashMap lookups.
+pub struct ChunkNeighborhood<'a> {
+    pub center: Option<&'a VoxelChunk>,
+    pub neg_x: Option<&'a VoxelChunk>,
+    pub pos_x: Option<&'a VoxelChunk>,
+    pub neg_y: Option<&'a VoxelChunk>,
+    pub pos_y: Option<&'a VoxelChunk>,
+    pub neg_z: Option<&'a VoxelChunk>,
+    pub pos_z: Option<&'a VoxelChunk>,
+}
+
+impl<'a> ChunkNeighborhood<'a> {
+    /// Gets a voxel at the given world-relative position within the neighborhood.
+    ///
+    /// The position is relative to the center chunk's (0,0,0).
+    pub fn get_voxel(&self, local_pos: VoxelPosition) -> Option<&Voxel> {
+        if (0..CHUNK_SIZE as i32).contains(&local_pos.x)
+            && (0..CHUNK_SIZE as i32).contains(&local_pos.y)
+            && (0..CHUNK_SIZE as i32).contains(&local_pos.z)
+        {
+            return self.center.map(|c| c.get_voxel(local_pos));
+        }
+
+        // Check neighbors
+        if local_pos.x < 0 {
+            self.neg_x.map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x + CHUNK_SIZE as i32,
+                    local_pos.y,
+                    local_pos.z,
+                ))
+            })
+        } else if local_pos.x >= CHUNK_SIZE as i32 {
+            self.pos_x.map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x - CHUNK_SIZE as i32,
+                    local_pos.y,
+                    local_pos.z,
+                ))
+            })
+        } else if local_pos.y < 0 {
+            self.neg_y.map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x,
+                    local_pos.y + CHUNK_SIZE as i32,
+                    local_pos.z,
+                ))
+            })
+        } else if local_pos.y >= CHUNK_SIZE as i32 {
+            self.pos_y.map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x,
+                    local_pos.y - CHUNK_SIZE as i32,
+                    local_pos.z,
+                ))
+            })
+        } else if local_pos.z < 0 {
+            self.neg_z.map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x,
+                    local_pos.y,
+                    local_pos.z + CHUNK_SIZE as i32,
+                ))
+            })
+        } else if local_pos.z >= CHUNK_SIZE as i32 {
+            self.pos_z.map(|c| {
+                c.get_voxel(VoxelPosition::new(
+                    local_pos.x,
+                    local_pos.y,
+                    local_pos.z - CHUNK_SIZE as i32,
+                ))
+            })
+        } else {
+            None
+        }
     }
 }
 
