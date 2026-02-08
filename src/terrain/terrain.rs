@@ -35,6 +35,12 @@ pub struct TerrainConfig {
     pub enable_multithreading: bool,
     /// Number of threads to use for terrain generation (0 = auto)
     pub num_threads: usize,
+    /// Distance (in chunks) to generate around the player
+    pub generation_distance: i32,
+    /// Distance (in chunks) to keep chunks visible
+    pub render_distance: i32,
+    /// Initial world size (in voxels) to generate at startup
+    pub initial_world_size: i32,
 }
 
 impl Default for TerrainConfig {
@@ -51,6 +57,9 @@ impl Default for TerrainConfig {
             enable_greedy_meshing: true,
             enable_multithreading: true,
             num_threads: 0, // 0 = auto-detect
+            generation_distance: 6,
+            render_distance: 5,
+            initial_world_size: 128,
         }
     }
 }
@@ -212,6 +221,25 @@ impl TerrainGenerator {
             trees_generated = trees_generated,
             "Terrain generation metrics"
         );
+
+        // Mark all chunks in this region as generated
+        let chunk_size = CHUNK_SIZE as i32;
+        let min_cx = min_x.div_euclid(chunk_size);
+        let max_cx = (max_x - 1).div_euclid(chunk_size);
+        let min_cz = min_z.div_euclid(chunk_size);
+        let max_cz = (max_z - 1).div_euclid(chunk_size);
+        let min_cy = (self.config.min_surface_height - 10).div_euclid(chunk_size);
+        let max_cy = (max_y - 1).div_euclid(chunk_size);
+
+        for cx in min_cx..=max_cx {
+            for cz in min_cz..=max_cz {
+                for cy in min_cy..=max_cy {
+                    let chunk_pos = crate::voxel::ChunkPosition::new(cx, cy, cz);
+                    let chunk = world.get_chunk_mut(&chunk_pos);
+                    chunk.generated = true;
+                }
+            }
+        }
     }
 
     /// Gets terrain height at the given XZ coordinates.
@@ -443,8 +471,8 @@ pub fn initialize_terrain(
 ) {
     let _profiler = crate::profiling::Profiler::new("initialize_terrain");
 
-    // Generate terrain in a 32x32 area around the origin
-    let world_size = 32;
+    // Generate terrain in a specified area around the origin
+    let world_size = config.initial_world_size;
     // Generate terrain covering our full height range plus some buffer
     let world_height = config.max_surface_height + 10;
 
@@ -519,32 +547,39 @@ pub fn generate_terrain_on_demand(
         let player_voxel_z = player_pos.z as i32;
 
         // Generate terrain in chunks around the player
-        let chunk_radius = 3; // Generate 3 chunks in each direction
+        let chunk_radius = config.generation_distance;
         let chunk_size = CHUNK_SIZE as i32;
 
-        for chunk_x in -chunk_radius..=chunk_radius {
-            for chunk_z in -chunk_radius..=chunk_radius {
-                // Calculate chunk position
-                let chunk_center_x = player_voxel_x + chunk_x * chunk_size;
-                let chunk_center_z = player_voxel_z + chunk_z * chunk_size;
+        let player_chunk_x = player_voxel_x.div_euclid(chunk_size);
+        let player_chunk_z = player_voxel_z.div_euclid(chunk_size);
+
+        for dx in -chunk_radius..=chunk_radius {
+            for dz in -chunk_radius..=chunk_radius {
+                // Calculate chunk coordinates
+                let cx = player_chunk_x + dx;
+                let cz = player_chunk_z + dz;
 
                 // Calculate chunk boundaries
-                let min_x = (chunk_center_x - chunk_size / 2).div_euclid(chunk_size) * chunk_size;
+                let min_x = cx * chunk_size;
                 let max_x = min_x + chunk_size;
-                let min_z = (chunk_center_z - chunk_size / 2).div_euclid(chunk_size) * chunk_size;
+                let min_z = cz * chunk_size;
                 let max_z = min_z + chunk_size;
 
                 // Check if this chunk already has terrain
                 // Use a more reliable check by looking for a chunk at a representative height
                 use crate::voxel::ChunkPosition;
                 let chunk_pos = ChunkPosition::new(
-                    min_x / chunk_size,
+                    cx,
                     (config.min_surface_height - 10).div_euclid(chunk_size),
-                    min_z / chunk_size,
+                    cz,
                 );
-                let has_terrain = world_resource.get_chunk(&chunk_pos).is_some();
 
-                if !has_terrain {
+                let is_generated = world_resource
+                    .get_chunk(&chunk_pos)
+                    .map(|c| c.generated)
+                    .unwrap_or(false);
+
+                if !is_generated {
                     // Create terrain region
                     let region = crate::parallel_terrain::TerrainRegion::new(
                         min_x,
@@ -574,6 +609,51 @@ pub fn generate_terrain_on_demand(
                             region.max_y,
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Bevy system to manage chunk visibility based on distance to player.
+///
+/// This system hides chunks that are further than the configured render distance.
+///
+/// # Arguments
+///
+/// * `config` - Terrain configuration
+/// * `player_query` - Query to find player position
+/// * `chunk_query` - Query to find all chunk entities
+pub fn manage_chunk_visibility(
+    config: Res<TerrainConfig>,
+    player_query: Query<&Transform, With<PlayerController>>,
+    mut chunk_query: Query<(&mut Visibility, &crate::voxel_mesh::ChunkComponent)>,
+) {
+    if let Ok(player_transform) = player_query.get_single() {
+        let player_pos = player_transform.translation;
+        let chunk_size = CHUNK_SIZE as f32;
+
+        // Use a slightly larger radius for the actual check to avoid flickering at the edge
+        let render_distance = config.render_distance as f32 * chunk_size;
+        let render_distance_sq = render_distance * render_distance;
+
+        for (mut visibility, chunk_comp) in chunk_query.iter_mut() {
+            let chunk_pos = chunk_comp.0;
+            // Calculate center of chunk in world coordinates (horizontal only)
+            let chunk_center_x = (chunk_pos.x * CHUNK_SIZE as i32) as f32 + chunk_size / 2.0;
+            let chunk_center_z = (chunk_pos.z * CHUNK_SIZE as i32) as f32 + chunk_size / 2.0;
+
+            let dx = player_pos.x - chunk_center_x;
+            let dz = player_pos.z - chunk_center_z;
+            let distance_sq = dx * dx + dz * dz;
+
+            if distance_sq > render_distance_sq {
+                if *visibility != Visibility::Hidden {
+                    *visibility = Visibility::Hidden;
+                }
+            } else {
+                if *visibility != Visibility::Inherited {
+                    *visibility = Visibility::Inherited;
                 }
             }
         }

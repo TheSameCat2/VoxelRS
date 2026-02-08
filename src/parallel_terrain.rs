@@ -4,7 +4,7 @@
 /// to significantly improve performance of terrain generation operations.
 /// It splits terrain into independent regions that can be processed in parallel.
 use crate::terrain::TerrainConfig;
-use crate::voxel::{Voxel, VoxelPosition, VoxelType, VoxelWorld};
+use crate::voxel::{Voxel, VoxelPosition, VoxelType, VoxelWorld, CHUNK_SIZE};
 use bevy::prelude::Color;
 use bevy::prelude::*;
 use noise::{NoiseFn, Perlin};
@@ -240,6 +240,25 @@ impl ParallelTerrainGenerator {
 
         // Generate ores for this region
         let ore_metrics = self.generate_ores_in_region(world, region);
+
+        // Mark all chunks in this region as generated
+        let chunk_size = CHUNK_SIZE as i32;
+        let min_cx = region.min_x.div_euclid(chunk_size);
+        let max_cx = (region.max_x - 1).div_euclid(chunk_size);
+        let min_cz = region.min_z.div_euclid(chunk_size);
+        let max_cz = (region.max_z - 1).div_euclid(chunk_size);
+        let min_cy = (self.config.min_surface_height - 10).div_euclid(chunk_size);
+        let max_cy = (region.max_y - 1).div_euclid(chunk_size);
+
+        for cx in min_cx..=max_cx {
+            for cz in min_cz..=max_cz {
+                for cy in min_cy..=max_cy {
+                    let chunk_pos = crate::voxel::ChunkPosition::new(cx, cy, cz);
+                    let chunk = world.get_chunk_mut(&chunk_pos);
+                    chunk.generated = true;
+                }
+            }
+        }
 
         TerrainGenerationMetrics {
             voxels_generated,

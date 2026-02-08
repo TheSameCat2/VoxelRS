@@ -20,8 +20,7 @@ mod tests {
         // Test multithreaded generation
         let start = Instant::now();
 
-        let (world, _metrics) =
-            generate_terrain_parallel(&region, &config, config.num_threads);
+        let (world, _metrics) = generate_terrain_parallel(&region, &config, config.num_threads);
 
         let elapsed = start.elapsed();
         println!("Multithreaded terrain generation took: {:?}", elapsed);

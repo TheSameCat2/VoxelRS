@@ -10,13 +10,18 @@ mod terrain;
 mod voxel;
 mod voxel_mesh;
 
-use terrain::{generate_terrain_on_demand, initialize_terrain, PlayerController, TerrainConfig};
+use terrain::{
+    generate_terrain_on_demand, initialize_terrain, manage_chunk_visibility, PlayerController,
+    TerrainConfig,
+};
 use voxel::{Voxel, VoxelPosition, VoxelType, VoxelWorld};
 use voxel_mesh::update_chunk_meshes;
 
 fn main() {
     // Initialize profiling system
     profiling::init_profiling();
+
+    println!("Starting voxel game...");
 
     App::new()
         .add_plugins(
@@ -41,6 +46,7 @@ fn main() {
                 player_voxel_interaction,
                 generate_terrain_on_demand,
                 update_chunk_meshes,
+                manage_chunk_visibility,
             ),
         )
         .run();
@@ -160,28 +166,37 @@ fn cursor_grab(
 fn player_voxel_interaction(
     mut world_resource: ResMut<VoxelWorld>,
     keyboard: Res<ButtonInput<KeyCode>>,
+    player_query: Query<&Transform, With<PlayerController>>,
 ) {
-    // Simple voxel editing for testing
-    // Press 'B' to place a block at player position
-    if keyboard.just_pressed(KeyCode::KeyB) {
-        let player_pos = VoxelPosition::new(0, 10, 0);
-        let block_voxel = Voxel::new(VoxelType::Solid, Color::srgb(1.0, 0.0, 0.0));
-        world_resource.set_voxel(&player_pos, block_voxel);
-    }
+    if let Ok(player_transform) = player_query.get_single() {
+        // Simple voxel editing for testing
+        // Get player position in voxel coordinates
+        let player_pos = player_transform.translation;
+        let voxel_pos = VoxelPosition::new(
+            player_pos.x.floor() as i32,
+            (player_pos.y - 1.0).floor() as i32, // Place/remove block below player
+            player_pos.z.floor() as i32,
+        );
 
-    // Press 'R' to remove a block at player position
-    if keyboard.just_pressed(KeyCode::KeyR) {
-        let player_pos = VoxelPosition::new(0, 10, 0);
-        let air_voxel = Voxel::new(VoxelType::Air, Color::BLACK);
-        world_resource.set_voxel(&player_pos, air_voxel);
-    }
+        // Press 'B' to place a block at player position
+        if keyboard.just_pressed(KeyCode::KeyB) {
+            let block_voxel = Voxel::new(VoxelType::Solid, Color::srgb(1.0, 0.0, 0.0));
+            world_resource.set_voxel(&voxel_pos, block_voxel);
+        }
 
-    // Press 'T' to add a test column starting at sea level
-    if keyboard.just_pressed(KeyCode::KeyT) {
-        for y in 0..15 {
-            let pos = VoxelPosition::new(0, y, 0);
-            let voxel = Voxel::new(VoxelType::Solid, Color::srgb(0.8, 0.4, 0.2));
-            world_resource.set_voxel(&pos, voxel);
+        // Press 'R' to remove a block at player position
+        if keyboard.just_pressed(KeyCode::KeyR) {
+            let air_voxel = Voxel::new(VoxelType::Air, Color::BLACK);
+            world_resource.set_voxel(&voxel_pos, air_voxel);
+        }
+
+        // Press 'T' to add a test column starting at sea level
+        if keyboard.just_pressed(KeyCode::KeyT) {
+            for y in 0..15 {
+                let pos = VoxelPosition::new(voxel_pos.x, y, voxel_pos.z);
+                let voxel = Voxel::new(VoxelType::Solid, Color::srgb(0.8, 0.4, 0.2));
+                world_resource.set_voxel(&pos, voxel);
+            }
         }
     }
 }

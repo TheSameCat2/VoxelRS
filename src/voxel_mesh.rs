@@ -1158,7 +1158,7 @@ pub fn update_chunk_meshes(
             // Create a new mesh
             let mut mesh = Mesh::new(
                 PrimitiveTopology::TriangleList,
-                RenderAssetUsages::RENDER_WORLD,
+                RenderAssetUsages::default(),
             );
 
             // Calculate how many vertices we have
@@ -1196,9 +1196,6 @@ pub fn update_chunk_meshes(
 
             // Set indices
             mesh.insert_indices(Indices::U32(indices));
-
-            // We already provide normals in our vertex data, so no need to compute them
-            mesh.duplicate_vertices();
 
             // Add the mesh to the asset storage
             let mesh_handle = meshes.add(mesh);
