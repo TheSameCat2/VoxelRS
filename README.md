@@ -29,7 +29,7 @@ sudo pacman -S --needed pkgconf alsa-lib
 
 ```bash
 cargo fmt
-cargo check
+cargo clippy
 cargo test
 cargo run
 ```
