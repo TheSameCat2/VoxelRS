@@ -21,7 +21,10 @@ use bevy::{
 use std::{fmt::Write, time::Instant};
 use tracing::{debug, info};
 
-use crate::{profiling::PerformanceMetrics, voxel::VoxelWorld};
+use crate::{
+    profiling::PerformanceMetrics,
+    voxel::{Voxel, VoxelWorld, CHUNK_SIZE},
+};
 
 /// Plugin for the performance HUD system.
 pub struct PerformanceHudPlugin;
@@ -243,11 +246,11 @@ pub fn collect_performance_metrics(
     // Collect metrics from profiling system
     performance_data.terrain_gen_time_ms = metrics.terrain_gen_time_ms();
     performance_data.mesh_gen_time_ms = metrics.mesh_gen_time_ms();
-    
+
     // Accumulate mesh stats from this frame
     performance_data.vertices += metrics.vertices_generated;
     performance_data.triangles += metrics.triangles_generated;
-    
+
     // Reset frame-based metrics
     metrics.vertices_generated = 0;
     metrics.triangles_generated = 0;
@@ -258,9 +261,9 @@ pub fn collect_performance_metrics(
     performance_data.chunks_dirty = world_resource.dirty_chunk_count();
 
     // Calculate memory usage (rough estimate)
-    // Each voxel is ~4 bytes (type) + 4 bytes (color) = 8 bytes
-    const BYTES_PER_VOXEL: usize = 8;
-    const VOXELS_PER_CHUNK: usize = 32 * 32 * 32; // 32x32x32 chunks
+    // Base estimate from raw voxel storage per chunk.
+    const BYTES_PER_VOXEL: usize = std::mem::size_of::<Voxel>();
+    const VOXELS_PER_CHUNK: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
     let total_voxels = performance_data.total_chunks * VOXELS_PER_CHUNK;
     performance_data.memory_usage_mb = (total_voxels * BYTES_PER_VOXEL) as f64 / 1024.0 / 1024.0;
 
@@ -332,7 +335,7 @@ pub fn update_hud_display(
             "Gen (0.5s): {} verts, {} tris",
             performance_data.vertices, performance_data.triangles
         );
-        
+
         // Reset accumulators for next interval
         performance_data.vertices = 0;
         performance_data.triangles = 0;

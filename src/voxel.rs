@@ -197,7 +197,7 @@ impl VoxelChunk {
     /// Converts local chunk coordinates to array index.
     ///
     /// This is used to store voxels in a flat array.
-    /// Uses Z-order (Morton order) for better cache locality.
+    /// Layout is linear in X within Y within Z.
     fn local_to_index(local_pos: VoxelPosition) -> usize {
         (local_pos.z as usize * CHUNK_SIZE * CHUNK_SIZE)
             + (local_pos.y as usize * CHUNK_SIZE)
